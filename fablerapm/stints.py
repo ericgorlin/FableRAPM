@@ -37,9 +37,32 @@ STINT_COLUMNS = [
     "def_team_id",
     "off_lineup",
     "def_lineup",
+    "garbage",
     "poss",
     "points",
 ]
+
+# Garbage-time rule: a 4th-quarter/OT possession is garbage when the score
+# margin at the start of the possession meets the threshold for how much
+# time remains in the period: (seconds_remaining <=, |margin| >=). The flag
+# is stored per stint row so the model can keep/drop/downweight it later.
+GARBAGE_TIERS = [(720, 25), (360, 18), (180, 12)]
+
+
+def _clock_seconds(clock: str) -> float:
+    minutes, seconds = clock.split(":")
+    return int(minutes) * 60 + float(seconds)
+
+
+def is_garbage_time(possession) -> bool:
+    if possession.period < 4:
+        return False
+    seconds = _clock_seconds(possession.start_time)
+    threshold = None
+    for max_seconds, margin in GARBAGE_TIERS:
+        if seconds <= max_seconds:
+            threshold = margin
+    return threshold is not None and abs(possession.start_score_margin) >= threshold
 
 _EMPTY_RESULT_SETS = {"resultSets": [{"headers": [], "rowSet": []}]}
 
@@ -85,6 +108,7 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
     poss_sums: dict[tuple, int] = {}
     point_sums: dict[tuple, int] = {}
     for possession in possessions:
+        garbage = is_garbage_time(possession)
         for stat in possession.possession_stats:
             key_off = None
             if stat["stat_key"] == OFFENSIVE_POSSESSION_STRING:
@@ -94,6 +118,7 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                     stat["lineup_id"],
                     stat["opponent_team_id"],
                     stat["opponent_lineup_id"],
+                    garbage,
                 )
                 poss_sums[key_off] = poss_sums.get(key_off, 0) + stat["stat_value"]
             elif stat["stat_key"] == OPPONENT_POINTS:
@@ -103,12 +128,13 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                     stat["opponent_lineup_id"],
                     stat["team_id"],
                     stat["lineup_id"],
+                    garbage,
                 )
                 point_sums[key_off] = point_sums.get(key_off, 0) + stat["stat_value"]
 
     rows = []
     for key in poss_sums.keys() | point_sums.keys():
-        off_team_id, off_lineup, def_team_id, def_lineup = key
+        off_team_id, off_lineup, def_team_id, def_lineup, garbage = key
         poss_x5 = poss_sums.get(key, 0)
         points_x5 = point_sums.get(key, 0)
         if poss_x5 % 5 != 0 or points_x5 % 5 != 0:
@@ -128,6 +154,7 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                 "def_team_id": def_team_id,
                 "off_lineup": off_lineup,
                 "def_lineup": def_lineup,
+                "garbage": garbage,
                 "poss": poss_x5 // 5,
                 "points": points_x5 // 5,
             }

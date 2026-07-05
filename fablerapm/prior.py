@@ -153,6 +153,32 @@ def two_phase_prior(
     }
 
 
+def last_season_prior(
+    data_dir: Path,
+    seasons: list[str],
+    season_types: list[str],
+    lam: float | str = "cv",
+    scale: float = 0.7,
+) -> dict[int, tuple[float, float]]:
+    """RAPM from the season before the earliest season in scope, scaled.
+
+    The cheapest stabilizer for single-season RAPM: last year's estimate is
+    a real prior (computed from disjoint data, so nothing leaks). ``scale``
+    < 1 reflects year-to-year regression toward the mean.
+    """
+    from .config import season_end_year, season_str
+    from .model import fit_rapm, load_stints
+
+    prev = season_str(min(season_end_year(s) for s in seasons) - 1)
+    stints = load_stints(data_dir, [prev], season_types)
+    logger.info("last-season prior: fitting %s %s", prev, season_types)
+    result = fit_rapm(stints, lam=lam)
+    return {
+        int(r.player_id): (scale * r.orapm, scale * r.drapm)
+        for r in result.players.itertuples()
+    }
+
+
 def spm_model_path(data_dir: Path) -> Path:
     return data_dir / "results" / "spm_model.json"
 
@@ -162,11 +188,16 @@ def train_spm(
     train_seasons: list[str],
     season_types: list[str],
     lam: float | str = "cv",
+    garbage_weight: float = 1.0,
 ) -> Path:
     """Train an SPM from stored features + per-season RAPM fits, save JSON.
 
     Fits RAPM per (season, type) directly from stints (independent of any
     CSVs already written) so targets always exist when stint data does.
+    Pass the same ``garbage_weight`` you use for final RAPM fits so the
+    prior is trained to predict the same quantity. (Note the *features*
+    are official season aggregates and always include garbage time — see
+    README.)
     """
     from .features import load_features
     from .model import fit_rapm, load_stints
@@ -175,7 +206,7 @@ def train_spm(
     for season in train_seasons:
         for season_type in season_types:
             stints = load_stints(data_dir, [season], [season_type])
-            result = fit_rapm(stints, lam=lam)
+            result = fit_rapm(stints, lam=lam, garbage_weight=garbage_weight)
             t = result.players[["player_id", "orapm", "drapm"]].copy()
             t["season"] = season
             t["season_type"] = season_type

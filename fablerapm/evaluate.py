@@ -59,14 +59,23 @@ def evaluate_variants(
     lam: float | str = "cv",
     test_frac: float = 0.2,
     seed: int = 0,
+    decay: float = 1.0,
+    playoff_weight: float = 1.0,
+    garbage_weight: float = 1.0,
+    score_garbage: bool = True,
 ) -> pd.DataFrame:
     """Fit each variant on train games, score on holdout games.
 
     Includes an intercept-only baseline. Lower holdout_mse is better; the
     interesting quantity is the gap each variant closes vs the baseline.
+
+    ``score_garbage=False`` drops garbage-time rows from the holdout metric
+    (use when tuning garbage_weight, so the target is non-garbage scoring).
     """
     train, test = holdout_split(stints, test_frac=test_frac, seed=seed)
     test = test[test["poss"] > 0]
+    if not score_garbage and "garbage" in test:
+        test = test[~test["garbage"].astype(bool)]
     logger.info(
         "Evaluation: %d train games, %d holdout games (%d holdout rows)",
         train["game_id"].nunique(), test["game_id"].nunique(), len(test),
@@ -82,7 +91,11 @@ def evaluate_variants(
 
     for name, prior_fn in variants.items():
         prior = prior_fn(train) if prior_fn is not None else None
-        result = fit_rapm(train, lam=lam, prior=prior)
+        result = fit_rapm(
+            train, lam=lam, prior=prior,
+            decay=decay, playoff_weight=playoff_weight,
+            garbage_weight=garbage_weight,
+        )
         rows.append({
             "variant": name,
             "lambda": result.meta["lambda"],

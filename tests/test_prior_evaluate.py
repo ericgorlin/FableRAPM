@@ -115,6 +115,26 @@ def test_evaluate_variants_truth_prior_wins():
     assert "vs_baseline" in table
 
 
+def test_last_season_prior_scales_previous_fit(tmp_path):
+    from fablerapm.config import stints_path
+    from fablerapm.prior import last_season_prior
+
+    data_dir = tmp_path / "data"
+    true_off, true_def = make_league()
+    prev = simulate_stints(true_off, true_def, n_games=30, seed=13)
+    path = stints_path(data_dir, "2023-24", "Regular Season")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev.to_parquet(path, index=False)
+
+    prior = last_season_prior(
+        data_dir, ["2024-25"], ["Regular Season"], lam=500.0, scale=0.5
+    )
+    direct = fit_rapm(prev, lam=500.0).players.set_index("player_id")
+    pid = int(direct.index[0])
+    assert prior[pid][0] == 0.5 * direct.loc[pid, "orapm"]
+    assert prior[pid][1] == 0.5 * direct.loc[pid, "drapm"]
+
+
 def test_predict_stints_handles_unseen_players():
     true_off, true_def = make_league()
     stints = simulate_stints(true_off, true_def, n_games=30, seed=6)

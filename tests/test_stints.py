@@ -11,8 +11,11 @@ LINEUP_B2 = "-".join(str(i) for i in [6, 7, 8, 9, 11])  # sub: 10 -> 11
 
 
 class FakePossession:
-    def __init__(self, stats, score=None):
+    def __init__(self, stats, score=None, period=1, start_time="10:00", margin=0):
         self.possession_stats = stats
+        self.period = period
+        self.start_time = start_time
+        self.start_score_margin = margin
         if score is not None:
             self.events = [type("E", (), {"score": score})()]
 
@@ -33,14 +36,14 @@ def player_rows(stat_key, value, team_id, lineup, opp_team_id, opp_lineup):
     ]
 
 
-def possession(off_team, off_lineup, def_team, def_lineup, points):
+def possession(off_team, off_lineup, def_team, def_lineup, points, **kwargs):
     """A normal possession: OffPoss for the offense, points against the defense."""
     stats = player_rows("OffPoss", 1, off_team, off_lineup, def_team, def_lineup)
     if points:
         stats += player_rows(
             "OpponentPoints", points, def_team, def_lineup, off_team, off_lineup
         )
-    return FakePossession(stats)
+    return FakePossession(stats, **kwargs)
 
 
 def test_basic_aggregation():
@@ -82,6 +85,37 @@ def test_invalid_lineup_size_raises():
     )
     with pytest.raises(ValueError, match="not divisible by 5|5 players"):
         possessions_to_stint_rows([bad], "TEST3")
+
+
+def test_garbage_time_rule():
+    from types import SimpleNamespace
+
+    from fablerapm.stints import is_garbage_time
+
+    def g(period, clock, margin):
+        return is_garbage_time(
+            SimpleNamespace(period=period, start_time=clock, start_score_margin=margin)
+        )
+
+    assert g(4, "10:00", 30) and g(4, "10:00", -30)
+    assert not g(4, "10:00", 20)  # threshold is 25 early in Q4
+    assert g(4, "5:00", 20)  # 18 inside 6 minutes
+    assert g(4, "2:00", -13)  # 12 inside 3 minutes
+    assert not g(2, "1:00", 40)  # never before Q4
+    assert g(5, "3:00", 12)  # overtime counts
+
+
+def test_garbage_possessions_split_into_separate_rows():
+    possessions = [
+        possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 2),
+        possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 3,
+                   period=4, start_time="2:00", margin=28),
+    ]
+    rows = possessions_to_stint_rows(possessions, "TESTG")
+    by_garbage = {r["garbage"]: r for r in rows}
+    assert len(rows) == 2
+    assert by_garbage[False]["poss"] == 1 and by_garbage[False]["points"] == 2
+    assert by_garbage[True]["poss"] == 1 and by_garbage[True]["points"] == 3
 
 
 def test_score_reconciliation():

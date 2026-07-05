@@ -87,10 +87,35 @@ def cmd_rapm(args) -> int:
         out_dir=args.out_dir,
         prior_kind=args.prior,
         prior_scale=args.prior_scale,
+        decay=args.decay,
+        playoff_weight=args.playoff_weight,
+        garbage_weight=args.garbage_weight,
     )
     for path in written:
         print(f"wrote {path}")
     return 0
+
+
+def cmd_validate(args) -> int:
+    from .validate import validate_many
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    reports, ok = validate_many(data_dir, seasons, season_types)
+    for r in reports:
+        status = "OK  " if not r["problems"] else "FAIL"
+        print(
+            f"[{status}] {r['season']} {r['season_type']}: "
+            f"{r.get('games_processed', 0)} games, "
+            f"{r.get('games_failed', 0)} failed, "
+            f"{len(r.get('score_mismatches', []))}/{r.get('score_checked', 0)} "
+            f"score mismatches, {r.get('pts_per_100', float('nan'))} pts/100"
+        )
+        for problem in r["problems"]:
+            print(f"       - {problem}")
+        for m in r.get("score_mismatches", [])[:5]:
+            print(f"       - {m}")
+    print("\nVALIDATION " + ("PASSED" if ok else "FAILED"))
+    return 0 if ok else 1
 
 
 def cmd_features(args) -> int:
@@ -111,7 +136,10 @@ def cmd_spm_train(args) -> int:
 
     data_dir, seasons, season_types = _resolve_common(args)
     lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
-    path = train_spm(data_dir, seasons, season_types, lam=lam)
+    path = train_spm(
+        data_dir, seasons, season_types, lam=lam,
+        garbage_weight=args.garbage_weight,
+    )
     print(f"wrote {path}")
     return 0
 
@@ -119,7 +147,12 @@ def cmd_spm_train(args) -> int:
 def cmd_evaluate(args) -> int:
     from .evaluate import evaluate_variants
     from .model import load_stints
-    from .prior import spm_model_path, spm_prior, two_phase_prior
+    from .prior import (
+        last_season_prior,
+        spm_model_path,
+        spm_prior,
+        two_phase_prior,
+    )
 
     data_dir, seasons, season_types = _resolve_common(args)
     stints = load_stints(data_dir, seasons, season_types)
@@ -130,6 +163,14 @@ def cmd_evaluate(args) -> int:
         variants[f"two-phase(scale={scale})"] = (
             lambda train, s=scale: two_phase_prior(train, lam=lam, scale=s)
         )
+    for scale in args.last_season_scales:
+        # built from the season before the evaluated scope: disjoint data,
+        # independent of the train/holdout split
+        variants[f"last-season(scale={scale})"] = (
+            lambda train, s=scale: last_season_prior(
+                data_dir, seasons, season_types, lam=lam, scale=s
+            )
+        )
     if args.spm:
         if not spm_model_path(data_dir).exists():
             print("No SPM model found; run `fablerapm spm-train` first")
@@ -138,8 +179,24 @@ def cmd_evaluate(args) -> int:
         # train/holdout stint split, so it can't leak holdout outcomes
         variants["spm"] = lambda train: spm_prior(data_dir, seasons, season_types)
 
-    table = evaluate_variants(
-        stints, variants, lam=lam, test_frac=args.test_frac, seed=args.seed
+    import pandas as pd
+
+    tables = []
+    for decay in args.decays:
+        for gw in args.garbage_weights:
+            for pw in args.playoff_weights:
+                t = evaluate_variants(
+                    stints, variants, lam=lam,
+                    test_frac=args.test_frac, seed=args.seed,
+                    decay=decay, playoff_weight=pw, garbage_weight=gw,
+                    score_garbage=not args.holdout_no_garbage,
+                )
+                t.insert(1, "decay", decay)
+                t.insert(2, "garbage_wt", gw)
+                t.insert(3, "playoff_wt", pw)
+                tables.append(t)
+    table = pd.concat(tables, ignore_index=True).sort_values(
+        "holdout_mse", ignore_index=True
     )
     print(table.to_string(index=False, float_format="%.4f"))
     return 0
@@ -211,15 +268,42 @@ def main(argv=None) -> int:
     )
     p_rapm.add_argument("--out-dir", type=Path, default=None)
     p_rapm.add_argument(
-        "--prior", choices=["none", "two-phase", "spm"], default="none",
+        "--prior", choices=["none", "two-phase", "spm", "last-season"],
+        default="none",
         help="Shrinkage target: 'two-phase' uses a first-pass RAPM (helps "
-        "star compression), 'spm' uses the trained box/tracking model",
+        "star compression), 'spm' uses the trained box/tracking model, "
+        "'last-season' uses the previous season's RAPM",
     )
     p_rapm.add_argument(
         "--prior-scale", type=float, default=1.0,
-        help="Scale applied to the two-phase prior (default 1.0)",
+        help="Scale applied to two-phase/last-season priors (default 1.0; "
+        "~0.5-0.8 is sensible for last-season)",
+    )
+    p_rapm.add_argument(
+        "--decay", type=float, default=1.0,
+        help="Per-season weight decay for pooled multi-season fits: stint "
+        "weight *= decay ** years_before_most_recent (default 1.0 = equal)",
+    )
+    p_rapm.add_argument(
+        "--playoff-weight", type=float, default=1.5,
+        help="Weight multiplier for playoff/play-in stints when season "
+        "types are pooled with --combine-types (default 1.5; has no effect "
+        "on single-type fits). Tune with `evaluate --playoff-weights`",
+    )
+    p_rapm.add_argument(
+        "--garbage-weight", type=float, default=1.0,
+        help="Weight multiplier for garbage-time stints: 1.0 keeps (default), "
+        "0 drops, in between downweights",
     )
     p_rapm.set_defaults(func=cmd_rapm)
+
+    p_val = sub.add_parser(
+        "validate",
+        help="Cross-check stored stints against official game-log scores "
+        "(offline, run after build)",
+    )
+    _add_common(p_val)
+    p_val.set_defaults(func=cmd_validate)
 
     p_feat = sub.add_parser(
         "features",
@@ -238,6 +322,11 @@ def main(argv=None) -> int:
     )
     _add_common(p_spm)
     p_spm.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_spm.add_argument(
+        "--garbage-weight", type=float, default=1.0,
+        help="Garbage-time weight for the RAPM target fits; match what you "
+        "use in `rapm` so the prior predicts the same quantity",
+    )
     p_spm.set_defaults(func=cmd_spm_train)
 
     p_eval = sub.add_parser(
@@ -251,8 +340,30 @@ def main(argv=None) -> int:
         help="Two-phase prior scales to evaluate (default: 1.0)",
     )
     p_eval.add_argument(
+        "--last-season-scales", type=float, nargs="*", default=[],
+        help="Also evaluate last-season priors at these scales "
+        "(needs the previous season's stints built)",
+    )
+    p_eval.add_argument(
         "--spm", action="store_true",
         help="Also evaluate the trained SPM prior (needs spm-train first)",
+    )
+    p_eval.add_argument(
+        "--decays", type=float, nargs="*", default=[1.0],
+        help="Season-decay values to grid over (default: 1.0)",
+    )
+    p_eval.add_argument(
+        "--garbage-weights", type=float, nargs="*", default=[1.0],
+        help="Garbage-time weights to grid over (default: 1.0)",
+    )
+    p_eval.add_argument(
+        "--playoff-weights", type=float, nargs="*", default=[1.0],
+        help="Playoff-stint weights to grid over (default: 1.0)",
+    )
+    p_eval.add_argument(
+        "--holdout-no-garbage", action="store_true",
+        help="Exclude garbage-time rows from the holdout metric "
+        "(recommended when tuning --garbage-weights)",
     )
     p_eval.add_argument("--test-frac", type=float, default=0.2)
     p_eval.add_argument("--seed", type=int, default=0)

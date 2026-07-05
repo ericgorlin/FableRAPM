@@ -89,7 +89,13 @@ and any accounting notes.
   the rare case no matching offensive possession exists, the orphaned points
   are dropped and counted in `meta.dropped_orphan_points` (a handful of
   points per season, at most).
-- All possessions are included — no garbage-time, heave, or leverage filters.
+- All possessions are stored; garbage time is *flagged*, and filtering or
+  downweighting is a fit-time choice (`--garbage-weight`), not a data choice.
+- SPM **features** are official full-season aggregates from stats.nba.com,
+  so they always include garbage time and can't be decayed per possession;
+  the weighting knobs apply to the stint regressions (including the SPM's
+  RAPM targets via `spm-train --garbage-weight`). Building garbage-aware
+  box features from our own play-by-play is possible future work.
 
 ### Failed games
 
@@ -113,6 +119,22 @@ priors are built in:
   per-player **box score + player-tracking** features (drives, touches,
   passing, contested shots, rebounding, speed/distance — tracking exists
   2013-14+; earlier seasons fall back to box/advanced only).
+- **Last-season prior** (`--prior last-season --prior-scale 0.7`): the
+  previous season's RAPM, scaled, as the shrinkage target.
+
+Weighting knobs (all recorded in the output meta):
+
+- `--decay 0.75`: in pooled multi-season fits, a stint's weight is
+  multiplied by `decay ** years_before_most_recent_season`.
+- `--playoff-weight` (default **1.5**): upweights playoff/play-in stints
+  when types are pooled with `--combine-types` (no effect on single-type
+  fits, where it would only distort the effective lambda).
+- `--garbage-weight`: 1.0 keeps garbage time (default), 0 drops it, between
+  downweights. Garbage time = Q4/OT possession starting with margin >= 25
+  (any time), 18 (last 6 min), or 12 (last 3 min) — flagged per stint at
+  parse time (`stints.GARBAGE_TIERS`), so changing the *rule* requires a
+  re-parse (delete `data/stints/`, re-run `build`; offline from the raw
+  cache), while changing the *weight* is instant.
 
 ```bash
 # 1. scrape features (8 requests/season: 2 box + 6 tracking)
@@ -124,14 +146,21 @@ fablerapm spm-train --seasons 2015-16:2023-24 --season-types regular
 # 3. use it as the RAPM prior
 fablerapm rapm --seasons 2024-25 --prior spm
 
-# compare variants on held-out games (possession-weighted MSE; priors are
-# computed from training games only)
+# compare variants and tune weights on held-out games (possession-weighted
+# MSE; priors are computed from training games only)
 fablerapm evaluate --seasons 2022-23:2024-25 --two-phase-scales 0.5 1.0 --spm
+fablerapm evaluate --seasons 2022-23:2024-25 \
+    --decays 1.0 0.9 0.75 --garbage-weights 1.0 0.5 0.0 --holdout-no-garbage
 ```
 
 `fablerapm evaluate` splits by game (default 20% holdout), fits each variant
 on the train side, and reports holdout MSE against an intercept-only
-baseline — the harness for testing any future calculation tweak.
+baseline, sorted best-first over the full grid of decay/garbage/playoff
+weights — the harness for learning every free parameter from data instead
+of guessing it. After building a season, run `fablerapm validate`: it
+cross-checks stint totals against the official game-log scores (an
+independent source), coverage against the schedule, and league points/100
+plausibility — all offline.
 
 ## Data layout
 

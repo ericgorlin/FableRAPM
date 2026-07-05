@@ -28,7 +28,7 @@ from scipy import sparse
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
 
-from .config import results_dir, season_type_slug, stints_path
+from .config import results_dir, season_end_year, season_type_slug, stints_path
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ def load_stints(
 class Design:
     X: sparse.csr_matrix
     y: np.ndarray
-    weights: np.ndarray
+    weights: np.ndarray  # regression weights: possessions x optional multiplier
     groups: np.ndarray  # game_id per row, for grouped CV
     player_ids: list[int]  # column j = offense, column n_players + j = defense
-    off_poss: np.ndarray  # per player
+    off_poss: np.ndarray  # per player, raw (unweighted) possession counts
     def_poss: np.ndarray
     dropped_points: int  # points in rows with 0 possessions (orphaned technical FTs)
 
@@ -111,9 +111,14 @@ def build_design(stints: pd.DataFrame) -> Design:
     poss = stints["poss"].to_numpy(dtype=np.float64)
     points = stints["points"].to_numpy(dtype=np.float64)
     y = 100.0 * points / poss
-    weights = poss
+    # regression weights may carry decay / season-type multipliers; player
+    # possession counts stay raw so the output columns remain exact tallies
+    if "weight_mult" in stints:
+        weights = poss * stints["weight_mult"].to_numpy(dtype=np.float64)
+    else:
+        weights = poss
 
-    poss_by_col = np.asarray(X.multiply(weights[:, None]).sum(axis=0)).ravel()
+    poss_by_col = np.asarray(X.multiply(poss[:, None]).sum(axis=0)).ravel()
     return Design(
         X=X,
         y=y,
@@ -179,6 +184,9 @@ def fit_rapm(
     lambdas=DEFAULT_LAMBDA_GRID,
     n_folds: int = 5,
     prior: dict[int, tuple[float, float]] | None = None,
+    decay: float = 1.0,
+    playoff_weight: float = 1.0,
+    garbage_weight: float = 1.0,
 ) -> RapmResult:
     """Fit RAPM on stint rows.
 
@@ -186,7 +194,53 @@ def fit_rapm(
     per-100 units (DRAPM prior in positive-is-good convention). Coefficients
     are shrunk toward the prior instead of zero; players missing from the
     prior shrink toward 0.
+
+    ``decay`` down-weights older seasons in pooled multi-season fits: a
+    stint's weight is multiplied by decay ** (years before the most recent
+    season in the data). 1.0 (default) weights all seasons equally.
+
+    ``playoff_weight`` multiplies the weight of non-regular-season stints
+    when season types are pooled (1.0 = no adjustment).
+
+    ``garbage_weight`` multiplies the weight of garbage-time stints
+    (see stints.GARBAGE_TIERS): 1.0 keeps them, 0.0 drops them entirely,
+    values in between downweight.
     """
+    if decay != 1.0 or playoff_weight != 1.0 or garbage_weight != 1.0:
+        mult = np.ones(len(stints))
+        if decay != 1.0:
+            if "season" not in stints:
+                raise ValueError("decay requires a 'season' column in stints")
+            end_years = stints["season"].map(season_end_year)
+            mult *= float(decay) ** (end_years.max() - end_years).to_numpy(dtype=float)
+        if playoff_weight != 1.0:
+            if "season_type" not in stints:
+                raise ValueError(
+                    "playoff_weight requires a 'season_type' column in stints"
+                )
+            # only meaningful when types are mixed; in a single-type fit a
+            # uniform multiplier would just distort the effective lambda
+            if stints["season_type"].nunique() > 1:
+                mult *= np.where(
+                    stints["season_type"] == "Regular Season",
+                    1.0,
+                    float(playoff_weight),
+                )
+        if garbage_weight != 1.0:
+            if "garbage" not in stints:
+                raise ValueError(
+                    "garbage_weight requires a 'garbage' column: re-parse "
+                    "stints (delete data/stints, re-run `fablerapm build` — "
+                    "the raw cache makes this offline and fast)"
+                )
+            mult *= np.where(
+                stints["garbage"].to_numpy(dtype=bool), float(garbage_weight), 1.0
+            )
+        stints = stints.assign(weight_mult=mult)
+        keep = stints["weight_mult"] > 0
+        if not keep.all():
+            stints = stints.loc[keep].reset_index(drop=True)
+
     design = build_design(stints)
     n_players = len(design.player_ids)
 
@@ -235,6 +289,9 @@ def fit_rapm(
         "intercept": float(model.intercept_),
         "dropped_orphan_points": design.dropped_points,
         "prior": "custom" if prior else None,
+        "decay": decay,
+        "playoff_weight": playoff_weight,
+        "garbage_weight": garbage_weight,
     }
     return RapmResult(players=players, meta=meta)
 
@@ -251,6 +308,9 @@ def run_rapm(
     out_dir: Path | None = None,
     prior_kind: str = "none",
     prior_scale: float = 1.0,
+    decay: float = 1.0,
+    playoff_weight: float = 1.0,
+    garbage_weight: float = 1.0,
 ) -> list[Path]:
     """Fit RAPM for each requested scope and write CSV + meta JSON.
 
@@ -283,13 +343,26 @@ def run_rapm(
                 from .prior import spm_prior
 
                 prior = spm_prior(data_dir, scope_seasons, scope_types)
+            elif prior_kind == "last-season":
+                from .prior import last_season_prior
+
+                prior = last_season_prior(
+                    data_dir, scope_seasons, scope_types,
+                    lam=lam, scale=prior_scale,
+                )
             elif prior_kind == "none":
                 prior = None
             else:
                 raise ValueError(f"Unknown prior kind {prior_kind!r}")
-            result = fit_rapm(stints, lam=lam, prior=prior)
+            result = fit_rapm(
+                stints, lam=lam, prior=prior,
+                decay=decay, playoff_weight=playoff_weight,
+                garbage_weight=garbage_weight,
+            )
             result.meta["prior"] = prior_kind
-            result.meta["prior_scale"] = prior_scale if prior_kind == "two-phase" else None
+            result.meta["prior_scale"] = (
+                prior_scale if prior_kind in ("two-phase", "last-season") else None
+            )
             players = result.players
 
             names = {}
