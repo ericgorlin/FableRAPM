@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+
+# scraped data & outputs (regenerable via `fablerapm build` / `fablerapm rapm`)
+data/
