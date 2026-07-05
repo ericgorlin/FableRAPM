@@ -379,7 +379,9 @@ def main(argv=None) -> int:
         "--passes", type=int, default=1,
         help="Coordinate-descent passes over the parameter grids",
     )
-    p_tune.set_defaults(func=cmd_tune)
+    # tuning on all 30 seasons is slow and mixes eras; recent seasons are
+    # the sensible zero-decision default (override with --seasons)
+    p_tune.set_defaults(func=cmd_tune, seasons="recent-3")
 
     p_val = sub.add_parser(
         "validate",

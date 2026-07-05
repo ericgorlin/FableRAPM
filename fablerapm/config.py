@@ -56,6 +56,10 @@ def parse_seasons(spec: str) -> list[str]:
             continue
         if part.lower() == "all":
             start, end = FIRST_PBP_SEASON_END_YEAR, current_season_end_year()
+        elif part.lower().startswith("recent-"):
+            n = int(part.split("-")[1])
+            end = current_season_end_year()
+            start = max(end - n + 1, FIRST_PBP_SEASON_END_YEAR)
         elif ":" in part:
             lo, hi = part.split(":")
             start, end = season_end_year(lo.strip()), season_end_year(hi.strip())

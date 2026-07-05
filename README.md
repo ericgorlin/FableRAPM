@@ -193,6 +193,26 @@ plausibility — all offline.
 Steps 2–3 alternate to convergence. Every knob is a flag; `evaluate` is the
 referee for all of them.
 
+## Zero-decisions quickstart
+
+If you don't want to choose anything yourself, run exactly this (each step
+is resumable; interrupt freely):
+
+```bash
+pip install -e ".[dev]"
+pytest                                   # offline checks
+fablerapm smoke-test                     # ~8 live API requests
+fablerapm build --seasons recent-3       # scrape 3 most recent seasons
+fablerapm validate --seasons recent-3    # verify vs official scores
+fablerapm tune                           # learn all tunable params (defaults to recent-3)
+fablerapm rapm --seasons recent-3 --tuned
+```
+
+Then extend backwards at your leisure: `fablerapm build` (full 1996-97 ->
+present, hours, resumable) followed by `validate` and
+`fablerapm rapm --tuned` for per-season history. `--seasons recent-N` and
+`all` work everywhere.
+
 ## Suggested experiments (in order)
 
 ```bash
@@ -292,6 +312,42 @@ fablerapm build                    # 1996-97 -> present, many hours, resumable
 fablerapm validate
 fablerapm rapm                     # per-season, both season types
 ```
+
+## TODOs (in rough priority order)
+
+The goal state is that *no* configuration is a human decision. What still
+stands between here and there:
+
+1. **Null calibration for curvature signs** (biggest one — detailed below).
+2. **Learn the garbage-time rule from data**: the margin/time tiers are
+   parse-time constants baked into a boolean. Store the possession's
+   start margin and seconds remaining on each stint row instead, and let
+   `tune` learn a smooth downweighting function of (margin, time) — turns
+   a data definition into a fit-time parameter. Requires a schema change +
+   re-parse (offline, from the raw cache).
+3. **Own box-score/tracking aggregation from play-by-play**: SPM features
+   currently come from official full-season aggregates, so they include
+   garbage time and can't be decayed or filtered consistently with the
+   stint weights. pbpstats emits per-event stats with the same lineup
+   attribution we already use; aggregating them ourselves makes features
+   consistent with every weighting knob and extends "tracking-adjacent"
+   features to all seasons.
+4. **Nested holdout for tune**: tune selects on the same holdout games it
+   reports; add an outer untouched test split so the reported MSE of the
+   winning config is unbiased (currently fine for *ranking* configs,
+   optimistic as an *estimate*).
+5. **Richer interaction basis**: splines/kernels over lineup talent
+   composition instead of three hand-picked convex shapes; the basis is a
+   one-line list (`model.INTERACTION_FEATURES`), and tune/evaluate already
+   referee additions. Position/role-aware concentration (creator vs big)
+   once SPM features exist per player.
+6. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
+   / opponent FT% with expected values at parse time (schema addition),
+   then let tune decide if it helps.
+7. **Parallel re-parse** (`build --workers N`): pure-Python possession
+   parsing dominates cache re-parses of 40k games.
+8. **Aging curve in the last-season prior**: scale by a learned age curve
+   rather than one global `prior_scale`.
 
 ## TODO: null calibration for curvature signs
 

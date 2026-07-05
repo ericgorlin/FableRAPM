@@ -30,6 +30,9 @@ def test_parse_seasons_forms():
     all_seasons = parse_seasons("all")
     assert all_seasons[0] == "1996-97"
     assert len(all_seasons) >= 30
+    recent = parse_seasons("recent-3")
+    assert len(recent) == 3
+    assert recent[-1] == all_seasons[-1]
 
 
 def test_parse_season_types():
