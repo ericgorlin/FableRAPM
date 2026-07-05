@@ -6,6 +6,7 @@
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -77,14 +78,8 @@ def cmd_rapm(args) -> int:
 
     data_dir, seasons, season_types = _resolve_common(args)
     lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
-    written = run_rapm(
-        data_dir, seasons, season_types,
-        pool_seasons=args.pool,
-        combine_types=args.combine_types,
+    kwargs = dict(
         lam=lam,
-        min_poss=args.min_poss,
-        fetch_names=not args.no_names,
-        out_dir=args.out_dir,
         prior_kind=args.prior,
         prior_scale=args.prior_scale,
         decay=args.decay,
@@ -94,8 +89,48 @@ def cmd_rapm(args) -> int:
         offense_curvature=args.offense_curvature,
         defense_curvature=args.defense_curvature,
     )
+    if args.tuned:
+        from .tune import load_tuned_config
+
+        cfg = load_tuned_config(data_dir)
+        kwargs = dict(
+            lam=cfg["lambda"],
+            prior_kind=cfg["prior"],
+            prior_scale=cfg["prior_scale"],
+            decay=cfg["decay"],
+            playoff_weight=cfg["playoff_weight"],
+            garbage_weight=cfg["garbage_weight"],
+            interactions=cfg["interactions"],
+            offense_curvature=cfg["offense_curvature"],
+            defense_curvature=cfg["defense_curvature"],
+        )
+        print(f"using tuned config: {kwargs}")
+    written = run_rapm(
+        data_dir, seasons, season_types,
+        pool_seasons=args.pool,
+        combine_types=args.combine_types,
+        min_poss=args.min_poss,
+        fetch_names=not args.no_names,
+        out_dir=args.out_dir,
+        **kwargs,
+    )
     for path in written:
         print(f"wrote {path}")
+    return 0
+
+
+def cmd_tune(args) -> int:
+    from .tune import tune
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+    result = tune(
+        data_dir, seasons, season_types,
+        n_seeds=args.seeds, test_frac=args.test_frac,
+        passes=args.passes, lam=lam,
+    )
+    print(json.dumps({k: v for k, v in result.items() if k != "history"}, indent=1))
+    print("use it with: fablerapm rapm --tuned")
     return 0
 
 
@@ -320,7 +355,31 @@ def main(argv=None) -> int:
         "synergy rather than diminishing returns, so free is most "
         "defensible here)",
     )
+    p_rapm.add_argument(
+        "--tuned", action="store_true",
+        help="Fit with the configuration learned by `fablerapm tune` "
+        "(overrides the model flags above)",
+    )
     p_rapm.set_defaults(func=cmd_rapm)
+
+    p_tune = sub.add_parser(
+        "tune",
+        help="Learn every tunable free parameter from held-out games and "
+        "save the winning config (use via `rapm --tuned`)",
+    )
+    _add_common(p_tune)
+    p_tune.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_tune.add_argument(
+        "--seeds", type=int, default=3,
+        help="Number of holdout splits to average (default 3; more = "
+        "slower but less noise-chasing)",
+    )
+    p_tune.add_argument("--test-frac", type=float, default=0.2)
+    p_tune.add_argument(
+        "--passes", type=int, default=1,
+        help="Coordinate-descent passes over the parameter grids",
+    )
+    p_tune.set_defaults(func=cmd_tune)
 
     p_val = sub.add_parser(
         "validate",

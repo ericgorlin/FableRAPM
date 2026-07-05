@@ -266,6 +266,25 @@ in `evaluate`. The principled upgrade (future work): null calibration —
 simulate additive data from the fitted linear model, re-fit the free
 interaction, and require the real gamma to fall outside that null band.
 
+**5b. Or learn everything at once.** `tune` runs greedy coordinate descent
+over all tunable parameters (garbage weight, decay, playoff weight, prior
+kind + scale, interactions + defense curvature; lambda by CV), scored on
+held-out games averaged over several seeds, and saves the winner:
+
+```bash
+fablerapm tune --seasons 2022-23:2024-25 --seeds 3
+fablerapm rapm --seasons 2022-23:2024-25 --pool --tuned
+```
+
+The full search history is in `data/results/tuned_config.json`. Caveats:
+holdout gaps between reasonable settings are small, so prefer more
+`--seeds` over more `--passes`; and parameters whose grid doesn't apply
+(decay on one season, playoff weight on one type, last-season prior
+without the previous season built) are skipped automatically. What tune
+does NOT search: parse-time definitions (garbage tiers, possession
+attribution), the interaction feature basis, and the offensive sign
+constraint — those are structural (see TODO below).
+
 **6. Full history**, once happy with settings:
 
 ```bash
@@ -273,6 +292,36 @@ fablerapm build                    # 1996-97 -> present, many hours, resumable
 fablerapm validate
 fablerapm rapm                     # per-season, both season types
 ```
+
+## TODO: null calibration for curvature signs
+
+The one free parameter still not honestly learnable from data is the
+*direction* of the interaction (diminishing returns vs synergy). The naive
+free-signed fit is biased: ridge shrinkage under-predicts talented
+lineups, so any talent-derived feature picks up fake positive curvature
+(demonstrated in `tests/test_interactions.py` — a controlled world with
+truly negative curvature yields a confidently positive unconstrained
+estimate), and a dense feature also substitutes penalty-cheaply for many
+shrunk player coefficients. The sign constraints (`--offense-curvature` /
+`--defense-curvature`, default `diminishing`) are the current defense.
+
+The principled fix — **null calibration** — is not yet implemented:
+
+1. Fit the linear model; simulate synthetic seasons from it (additive
+   truth, so real curvature = 0 by construction, matching real possession
+   counts and lineups; Poisson or resampled stint outcomes).
+2. Re-fit the free-signed interaction on each simulation → the null
+   distribution of each gamma under "no curvature + this estimator's
+   biases".
+3. On real data, report a free-signed gamma as a finding only where it
+   falls outside the null band (and subtract the null mean as a bias
+   correction).
+
+This would make even the sign a data-driven conclusion, and would slot in
+as a `fablerapm calibrate-curvature` command reusing `fit_interaction_rapm`
+with `offense_curvature="free", defense_curvature="free"` on simulated
+stints. Until then, treat free-signed gammas as suggestive only if they
+replicate across seasons and win in `evaluate`.
 
 ## Data layout
 
