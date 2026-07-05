@@ -85,9 +85,63 @@ def cmd_rapm(args) -> int:
         min_poss=args.min_poss,
         fetch_names=not args.no_names,
         out_dir=args.out_dir,
+        prior_kind=args.prior,
+        prior_scale=args.prior_scale,
     )
     for path in written:
         print(f"wrote {path}")
+    return 0
+
+
+def cmd_features(args) -> int:
+    from .features import build_season_features
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    for season in seasons:
+        for season_type in season_types:
+            path = build_season_features(
+                data_dir, season, season_type, tracking=not args.no_tracking
+            )
+            print(f"wrote {path}")
+    return 0
+
+
+def cmd_spm_train(args) -> int:
+    from .prior import train_spm
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+    path = train_spm(data_dir, seasons, season_types, lam=lam)
+    print(f"wrote {path}")
+    return 0
+
+
+def cmd_evaluate(args) -> int:
+    from .evaluate import evaluate_variants
+    from .model import load_stints
+    from .prior import spm_model_path, spm_prior, two_phase_prior
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    stints = load_stints(data_dir, seasons, season_types)
+    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+
+    variants = {"plain": None}
+    for scale in args.two_phase_scales:
+        variants[f"two-phase(scale={scale})"] = (
+            lambda train, s=scale: two_phase_prior(train, lam=lam, scale=s)
+        )
+    if args.spm:
+        if not spm_model_path(data_dir).exists():
+            print("No SPM model found; run `fablerapm spm-train` first")
+            return 1
+        # SPM prior comes from features + a saved model, independent of the
+        # train/holdout stint split, so it can't leak holdout outcomes
+        variants["spm"] = lambda train: spm_prior(data_dir, seasons, season_types)
+
+    table = evaluate_variants(
+        stints, variants, lam=lam, test_frac=args.test_frac, seed=args.seed
+    )
+    print(table.to_string(index=False, float_format="%.4f"))
     return 0
 
 
@@ -156,7 +210,53 @@ def main(argv=None) -> int:
         help="Skip fetching player names (fully offline)",
     )
     p_rapm.add_argument("--out-dir", type=Path, default=None)
+    p_rapm.add_argument(
+        "--prior", choices=["none", "two-phase", "spm"], default="none",
+        help="Shrinkage target: 'two-phase' uses a first-pass RAPM (helps "
+        "star compression), 'spm' uses the trained box/tracking model",
+    )
+    p_rapm.add_argument(
+        "--prior-scale", type=float, default=1.0,
+        help="Scale applied to the two-phase prior (default 1.0)",
+    )
     p_rapm.set_defaults(func=cmd_rapm)
+
+    p_feat = sub.add_parser(
+        "features",
+        help="Scrape per-player box score + tracking features (for SPM prior)",
+    )
+    _add_common(p_feat)
+    p_feat.add_argument(
+        "--no-tracking", action="store_true",
+        help="Skip player-tracking endpoints (tracking exists 2013-14+)",
+    )
+    p_feat.set_defaults(func=cmd_features)
+
+    p_spm = sub.add_parser(
+        "spm-train",
+        help="Train the SPM prior model from stored features + stint data",
+    )
+    _add_common(p_spm)
+    p_spm.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_spm.set_defaults(func=cmd_spm_train)
+
+    p_eval = sub.add_parser(
+        "evaluate",
+        help="Compare RAPM variants by weighted MSE on held-out games",
+    )
+    _add_common(p_eval)
+    p_eval.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_eval.add_argument(
+        "--two-phase-scales", type=float, nargs="*", default=[1.0],
+        help="Two-phase prior scales to evaluate (default: 1.0)",
+    )
+    p_eval.add_argument(
+        "--spm", action="store_true",
+        help="Also evaluate the trained SPM prior (needs spm-train first)",
+    )
+    p_eval.add_argument("--test-frac", type=float, default=0.2)
+    p_eval.add_argument("--seed", type=int, default=0)
+    p_eval.set_defaults(func=cmd_evaluate)
 
     p_smoke = sub.add_parser(
         "smoke-test",

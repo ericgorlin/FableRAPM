@@ -99,19 +99,39 @@ undeterminable period starters). They are skipped and recorded in
 pbpstats override files in `data/raw/overrides/` (see the pbpstats docs),
 then reprocessed with `fablerapm build --retry-failed`.
 
-## Extending the model (planned)
+## Model variants & evaluation
 
-`fablerapm.model.fit_rapm` already accepts a `prior` mapping
-`player_id -> (orapm_prior, drapm_prior)`; coefficients shrink toward the
-prior instead of zero. That is the hook for:
+`fit_rapm` accepts a `prior` mapping `player_id -> (orapm_prior,
+drapm_prior)`; coefficients shrink toward the prior instead of zero. Two
+priors are built in:
 
-- **Box-score prior**: compute a statistical plus-minus from box-score data
-  and pass it as `prior`.
-- **Two-phase RAPM** (counteracting diminishing-returns on stars): fit phase
-  one, transform its output, pass it as the prior for phase two.
-- **Evaluation**: `model.cross_validate_lambda` already computes game-grouped
-  held-out weighted MSE; use the same grouped splits to compare model
-  variants on a season-level holdout.
+- **Two-phase RAPM** (`--prior two-phase`): phase one is a plain RAPM; phase
+  two re-fits shrinking toward it, letting star coefficients escape flat
+  shrinkage (diminishing-returns compression). `--prior-scale` scales the
+  prior. Self-contained — needs only stint data.
+- **SPM prior** (`--prior spm`): a statistical plus-minus built from
+  per-player **box score + player-tracking** features (drives, touches,
+  passing, contested shots, rebounding, speed/distance — tracking exists
+  2013-14+; earlier seasons fall back to box/advanced only).
+
+```bash
+# 1. scrape features (8 requests/season: 2 box + 6 tracking)
+fablerapm features --seasons 2015-16:2024-25
+
+# 2. train the SPM (ridge: features -> per-season RAPM, minutes-weighted CV)
+fablerapm spm-train --seasons 2015-16:2023-24 --season-types regular
+
+# 3. use it as the RAPM prior
+fablerapm rapm --seasons 2024-25 --prior spm
+
+# compare variants on held-out games (possession-weighted MSE; priors are
+# computed from training games only)
+fablerapm evaluate --seasons 2022-23:2024-25 --two-phase-scales 0.5 1.0 --spm
+```
+
+`fablerapm evaluate` splits by game (default 20% holdout), fits each variant
+on the train side, and reports holdout MSE against an intercept-only
+baseline — the harness for testing any future calculation tweak.
 
 ## Data layout
 

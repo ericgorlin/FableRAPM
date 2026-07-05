@@ -249,6 +249,8 @@ def run_rapm(
     min_poss: float = 0,
     fetch_names: bool = True,
     out_dir: Path | None = None,
+    prior_kind: str = "none",
+    prior_scale: float = 1.0,
 ) -> list[Path]:
     """Fit RAPM for each requested scope and write CSV + meta JSON.
 
@@ -273,7 +275,21 @@ def run_rapm(
                     "No stint rows for %s %s; skipping", scope_seasons, scope_types
                 )
                 continue
-            result = fit_rapm(stints, lam=lam)
+            if prior_kind == "two-phase":
+                from .prior import two_phase_prior
+
+                prior = two_phase_prior(stints, lam=lam, scale=prior_scale)
+            elif prior_kind == "spm":
+                from .prior import spm_prior
+
+                prior = spm_prior(data_dir, scope_seasons, scope_types)
+            elif prior_kind == "none":
+                prior = None
+            else:
+                raise ValueError(f"Unknown prior kind {prior_kind!r}")
+            result = fit_rapm(stints, lam=lam, prior=prior)
+            result.meta["prior"] = prior_kind
+            result.meta["prior_scale"] = prior_scale if prior_kind == "two-phase" else None
             players = result.players
 
             names = {}
@@ -299,6 +315,8 @@ def run_rapm(
             )
             type_label = "_".join(season_type_slug(t) for t in scope_types)
             base = f"rapm_{season_label.replace('-', '_')}_{type_label}"
+            if prior_kind != "none":
+                base += f"_{prior_kind.replace('-', '')}"
             csv_path = out_dir / f"{base}.csv"
             players.to_csv(csv_path, index=False, float_format="%.3f")
             meta = dict(result.meta)
