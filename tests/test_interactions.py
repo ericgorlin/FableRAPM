@@ -70,13 +70,15 @@ def test_interactions_recover_stacked_stars():
     inter_result = fit_interaction_rapm(stints, lam=500.0)
     inter = inter_result.players.set_index("player_id")
 
-    # The contract: the offensive curvature coefficient is never positive
-    # (clamped to the diminishing-returns hypothesis), so the correction can
-    # only hand a stacking penalty back to players — never take credit away.
-    # At this synthetic's noise level the redundancy signal is swamped by
-    # shrinkage bias, so gamma clamps to ~0 and the fit degrades gracefully
-    # to the linear two-phase (decompressed) estimates.
-    assert inter_result.meta["interaction"]["coef_off_sq"] <= 0
+    # The contract: offensive curvature coefficients are never positive
+    # (sign-constrained to the diminishing-returns hypothesis), so the
+    # correction can only hand a stacking penalty back to players — never
+    # take credit away. At this synthetic's noise level the redundancy
+    # signal is swamped by shrinkage bias, so gammas land at ~0 and the fit
+    # degrades gracefully to the linear two-phase (decompressed) estimates.
+    inter_meta = inter_result.meta["interaction"]
+    assert all(g <= 0 for g in inter_meta["gamma_off"].values())
+    assert all(g >= 0 for g in inter_meta["gamma_def"].values())
     # nobody is worse off than under plain linear RAPM (decompression >= 0)
     for pid in (1, 2, LONE_STAR + 1):
         assert inter.loc[pid, "orapm"] >= linear.loc[pid, "orapm"] - 1e-6

@@ -48,18 +48,20 @@ def predict_stints(result: RapmResult, stints: pd.DataFrame) -> np.ndarray:
             - sum(d.get(int(p), 0.0) for p in def_lineups[i].split("-"))
         )
     if "interaction" in result.meta:
-        from .model import _lineup_top2_product, _standardize
+        from .model import _concentration_features
 
         inter = result.meta["interaction"]
         talent = {int(k): tuple(v) for k, v in inter["talent"].items()}
         w = stints["poss"].to_numpy(dtype=float)
-        q_off, _ = _standardize(
-            _lineup_top2_product(off_lineups, talent, 0), w, inter["info"]["off"]
+        F_off, _ = _concentration_features(
+            off_lineups, talent, 0, w, inter["info"]["off"]
         )
-        q_def, _ = _standardize(
-            _lineup_top2_product(def_lineups, talent, 1), w, inter["info"]["def"]
+        F_def, _ = _concentration_features(
+            def_lineups, talent, 1, w, inter["info"]["def"]
         )
-        preds += inter["coef_off_sq"] * q_off + inter["coef_def_sq"] * q_def
+        g_off = np.array([inter["gamma_off"][f] for f in inter["features"]])
+        g_def = np.array([inter["gamma_def"][f] for f in inter["features"]])
+        preds += F_off @ g_off + F_def @ g_def
     return preds
 
 

@@ -74,31 +74,48 @@ class Design:
     interaction_info: dict | None = None  # standardization params for reuse
 
 
-def _lineup_top2_product(lineups: np.ndarray, talent: dict, idx: int) -> np.ndarray:
-    """Product of the two largest positive talents in each lineup.
+# Convex functions of the lineup's positive talents. Diminishing returns =
+# concave production, so these enter with sign-constrained coefficients
+# (concavity is the only baked-in assumption); which shapes matter — pair
+# concentration vs overall talent level — is learned from data, separately
+# for offense and defense.
+INTERACTION_FEATURES = ["top2", "pairs", "total_sq"]
 
-    A talent-*concentration* feature: it is large only when two creators
-    share the floor, and stays small for one star plus role players — which
-    is what distinguishes redundancy (diminishing returns) from mere total
-    talent. Symmetric sums or squared totals fail here: they are also high
-    for a lone star's lineups, whose residuals have the opposite sign.
+
+def _concentration_features(
+    lineups: np.ndarray,
+    talent: dict,
+    idx: int,
+    w: np.ndarray,
+    info: list[dict] | None = None,
+) -> tuple[np.ndarray, list[dict]]:
+    """Standardized convex talent-concentration features for one side.
+
+    top2:     product of the two largest positive talents (two creators
+              sharing the floor)
+    pairs:    sum of all pairwise positive-talent products (overall
+              concentration)
+    total_sq: squared summed positive talent (curvature in total talent)
     """
-    out = np.empty(len(lineups))
+    raw = np.empty((len(lineups), len(INTERACTION_FEATURES)))
     for i, lineup in enumerate(lineups):
         t = sorted(
             (max(talent.get(int(p), (0.0, 0.0))[idx], 0.0) for p in lineup.split("-")),
             reverse=True,
         )
-        out[i] = t[0] * t[1]
-    return out
-
-
-def _standardize(F: np.ndarray, w: np.ndarray, params: dict | None = None):
-    if params is None:
-        m = float(np.average(F, weights=w))
-        s = float(np.sqrt(np.average((F - m) ** 2, weights=w))) or 1.0
-        params = {"m": m, "s": s}
-    return (F - params["m"]) / params["s"], params
+        total = sum(t)
+        raw[i, 0] = t[0] * t[1]
+        raw[i, 1] = (total * total - sum(x * x for x in t)) / 2.0
+        raw[i, 2] = total * total
+    if info is None:
+        info = []
+        for j in range(raw.shape[1]):
+            m = float(np.average(raw[:, j], weights=w))
+            s = float(np.sqrt(np.average((raw[:, j] - m) ** 2, weights=w))) or 1.0
+            info.append({"m": m, "s": s})
+    for j, p in enumerate(info):
+        raw[:, j] = (raw[:, j] - p["m"]) / p["s"]
+    return raw, info
 
 
 def _parse_lineup(lineup: str) -> list[int]:
@@ -154,16 +171,16 @@ def build_design(
     n_interactions = 0
     interaction_info = None
     if interaction_talent is not None:
-        q_off, p_off = _standardize(
-            _lineup_top2_product(off_lineups, interaction_talent, 0), weights
+        F_off, p_off = _concentration_features(
+            off_lineups, interaction_talent, 0, weights
         )
-        q_def, p_def = _standardize(
-            _lineup_top2_product(def_lineups, interaction_talent, 1), weights
+        F_def, p_def = _concentration_features(
+            def_lineups, interaction_talent, 1, weights
         )
         X = sparse.hstack(
-            [X, sparse.csr_matrix(np.column_stack([q_off, q_def]))], format="csr"
+            [X, sparse.csr_matrix(np.hstack([F_off, F_def]))], format="csr"
         )
-        n_interactions = 2
+        n_interactions = F_off.shape[1] + F_def.shape[1]
         interaction_info = {"off": p_off, "def": p_def}
 
     return Design(
@@ -407,10 +424,17 @@ def fit_interaction_rapm(
 
     design = build_design(stints, interaction_talent=talent)
     n_players = len(design.player_ids)
+    n_feat = design.n_interactions // 2
     X_lin = design.X[:, : 2 * n_players]
     F = np.asarray(design.X[:, 2 * n_players :].todense())
     W = design.weights
-    FtWF = (F.T * W) @ F
+    sw = np.sqrt(W)
+    # sign constraints encode concavity only: offensive concentration can
+    # only subtract points (gamma <= 0); defensive concentration can only
+    # raise opponent scoring relative to linear (gamma >= 0, points-allowed
+    # terms). Solved as NNLS after flipping the offense block.
+    signs = np.concatenate([-np.ones(n_feat), np.ones(n_feat)])
+    A = (F * signs) * sw[:, None]
 
     # anchor: user prior if given, else the decompressed phase-2 estimates
     effective_prior = prior if prior is not None else talent
@@ -421,7 +445,9 @@ def fit_interaction_rapm(
             prior_vec[j] = o
             prior_vec[n_players + j] = -d
 
-    gamma = np.zeros(2)
+    from scipy.optimize import nnls
+
+    gamma = np.zeros(2 * n_feat)
     coef = prior_vec
     intercept = 0.0
     for _ in range(8):
@@ -434,9 +460,7 @@ def fit_interaction_rapm(
         # residual against the linear part only, so it still contains the
         # F-explained variation; gamma is re-solved in full, not incremented
         residual = design.y - intercept - X_lin @ coef
-        new_gamma = np.linalg.solve(FtWF, (F.T * W) @ residual)
-        new_gamma[0] = min(new_gamma[0], 0.0)  # offense: diminishing returns
-        new_gamma[1] = max(new_gamma[1], 0.0)  # defense (points-allowed terms)
+        new_gamma = signs * nnls(A, residual * sw)[0]
         if np.allclose(new_gamma, gamma, atol=1e-6):
             gamma = new_gamma
             break
@@ -463,10 +487,15 @@ def fit_interaction_rapm(
             "intercept": float(model.intercept_),
             "prior": "custom" if prior else "phase2",
             "interaction": {
-                # per-100 effect per 1 SD of positive-part-squared lineup
-                # talent; negative offense value = diminishing returns
-                "coef_off_sq": float(gamma[0]),
-                "coef_def_sq": float(gamma[1]),
+                # per-100 effect per 1 SD of each concentration feature;
+                # negative offense values = diminishing returns
+                "features": INTERACTION_FEATURES,
+                "gamma_off": {
+                    f: float(g) for f, g in zip(INTERACTION_FEATURES, gamma[:n_feat])
+                },
+                "gamma_def": {
+                    f: float(g) for f, g in zip(INTERACTION_FEATURES, gamma[n_feat:])
+                },
                 "info": design.interaction_info,
                 "talent": {
                     str(pid): [round(o, 4), round(d, 4)]
