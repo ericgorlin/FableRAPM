@@ -121,6 +121,19 @@ priors are built in:
   2013-14+; earlier seasons fall back to box/advanced only).
 - **Last-season prior** (`--prior last-season --prior-scale 0.7`): the
   previous season's RAPM, scaled, as the shrinkage target.
+- **Nonlinear two-phase** (`--interactions`): linear two-phase plus a
+  talent-*concentration* regressor (product of the lineup's top two
+  positive talents) fit jointly with player coefficients anchored to the
+  decompressed estimates, sign-clamped to the diminishing-returns
+  hypothesis. When the data shows concave lineup production (two creators
+  produce less than the sum of their parts — the LeBron-next-to-Wade
+  effect), the penalty flows to the curvature term instead of the stars;
+  when it doesn't, gamma clamps to zero and the fit reduces to linear
+  two-phase. See `fit_interaction_rapm`'s docstring for why each piece is
+  load-bearing; note that in controlled synthetic tests the redundancy
+  detector is conservative (shrinkage bias competes with the signal), so
+  treat nonzero gammas on real data as the interesting finding, and
+  compare with `evaluate --interactions`.
 
 Weighting knobs (all recorded in the output meta):
 

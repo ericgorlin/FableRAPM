@@ -12,11 +12,13 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .model import RapmResult, fit_rapm
+from .model import RapmResult, fit_interaction_rapm, fit_rapm
 
 logger = logging.getLogger(__name__)
 
 PriorFn = Callable[[pd.DataFrame], dict[int, tuple[float, float]] | None]
+# a variant is either a prior fn (or None), or a dict:
+#   {"prior_fn": PriorFn | None, "interactions": bool}
 
 
 def holdout_split(
@@ -45,6 +47,19 @@ def predict_stints(result: RapmResult, stints: pd.DataFrame) -> np.ndarray:
             + sum(o.get(int(p), 0.0) for p in off_lineups[i].split("-"))
             - sum(d.get(int(p), 0.0) for p in def_lineups[i].split("-"))
         )
+    if "interaction" in result.meta:
+        from .model import _lineup_top2_product, _standardize
+
+        inter = result.meta["interaction"]
+        talent = {int(k): tuple(v) for k, v in inter["talent"].items()}
+        w = stints["poss"].to_numpy(dtype=float)
+        q_off, _ = _standardize(
+            _lineup_top2_product(off_lineups, talent, 0), w, inter["info"]["off"]
+        )
+        q_def, _ = _standardize(
+            _lineup_top2_product(def_lineups, talent, 1), w, inter["info"]["def"]
+        )
+        preds += inter["coef_off_sq"] * q_off + inter["coef_def_sq"] * q_def
     return preds
 
 
@@ -89,9 +104,13 @@ def evaluate_variants(
         "holdout_mse": _weighted_mse(test, baseline_pred),
     }]
 
-    for name, prior_fn in variants.items():
+    for name, spec in variants.items():
+        if not isinstance(spec, dict):
+            spec = {"prior_fn": spec, "interactions": False}
+        prior_fn = spec.get("prior_fn")
         prior = prior_fn(train) if prior_fn is not None else None
-        result = fit_rapm(
+        fit = fit_interaction_rapm if spec.get("interactions") else fit_rapm
+        result = fit(
             train, lam=lam, prior=prior,
             decay=decay, playoff_weight=playoff_weight,
             garbage_weight=garbage_weight,

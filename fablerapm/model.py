@@ -70,13 +70,44 @@ class Design:
     off_poss: np.ndarray  # per player, raw (unweighted) possession counts
     def_poss: np.ndarray
     dropped_points: int  # points in rows with 0 possessions (orphaned technical FTs)
+    n_interactions: int = 0  # trailing dense columns (lineup talent terms)
+    interaction_info: dict | None = None  # standardization params for reuse
+
+
+def _lineup_top2_product(lineups: np.ndarray, talent: dict, idx: int) -> np.ndarray:
+    """Product of the two largest positive talents in each lineup.
+
+    A talent-*concentration* feature: it is large only when two creators
+    share the floor, and stays small for one star plus role players — which
+    is what distinguishes redundancy (diminishing returns) from mere total
+    talent. Symmetric sums or squared totals fail here: they are also high
+    for a lone star's lineups, whose residuals have the opposite sign.
+    """
+    out = np.empty(len(lineups))
+    for i, lineup in enumerate(lineups):
+        t = sorted(
+            (max(talent.get(int(p), (0.0, 0.0))[idx], 0.0) for p in lineup.split("-")),
+            reverse=True,
+        )
+        out[i] = t[0] * t[1]
+    return out
+
+
+def _standardize(F: np.ndarray, w: np.ndarray, params: dict | None = None):
+    if params is None:
+        m = float(np.average(F, weights=w))
+        s = float(np.sqrt(np.average((F - m) ** 2, weights=w))) or 1.0
+        params = {"m": m, "s": s}
+    return (F - params["m"]) / params["s"], params
 
 
 def _parse_lineup(lineup: str) -> list[int]:
     return [int(p) for p in lineup.split("-")]
 
 
-def build_design(stints: pd.DataFrame) -> Design:
+def build_design(
+    stints: pd.DataFrame, interaction_talent: dict | None = None
+) -> Design:
     zero_poss = stints["poss"] == 0
     dropped_points = int(stints.loc[zero_poss, "points"].sum())
     if dropped_points:
@@ -119,6 +150,22 @@ def build_design(stints: pd.DataFrame) -> Design:
         weights = poss
 
     poss_by_col = np.asarray(X.multiply(poss[:, None]).sum(axis=0)).ravel()
+
+    n_interactions = 0
+    interaction_info = None
+    if interaction_talent is not None:
+        q_off, p_off = _standardize(
+            _lineup_top2_product(off_lineups, interaction_talent, 0), weights
+        )
+        q_def, p_def = _standardize(
+            _lineup_top2_product(def_lineups, interaction_talent, 1), weights
+        )
+        X = sparse.hstack(
+            [X, sparse.csr_matrix(np.column_stack([q_off, q_def]))], format="csr"
+        )
+        n_interactions = 2
+        interaction_info = {"off": p_off, "def": p_def}
+
     return Design(
         X=X,
         y=y,
@@ -128,7 +175,54 @@ def build_design(stints: pd.DataFrame) -> Design:
         off_poss=poss_by_col[:n_players],
         def_poss=poss_by_col[n_players:],
         dropped_points=dropped_points,
+        n_interactions=n_interactions,
+        interaction_info=interaction_info,
     )
+
+
+def _apply_weight_multipliers(
+    stints: pd.DataFrame,
+    decay: float = 1.0,
+    playoff_weight: float = 1.0,
+    garbage_weight: float = 1.0,
+) -> pd.DataFrame:
+    """Attach a weight_mult column and drop zero-weight rows."""
+    if decay == 1.0 and playoff_weight == 1.0 and garbage_weight == 1.0:
+        return stints
+    mult = np.ones(len(stints))
+    if decay != 1.0:
+        if "season" not in stints:
+            raise ValueError("decay requires a 'season' column in stints")
+        end_years = stints["season"].map(season_end_year)
+        mult *= float(decay) ** (end_years.max() - end_years).to_numpy(dtype=float)
+    if playoff_weight != 1.0:
+        if "season_type" not in stints:
+            raise ValueError(
+                "playoff_weight requires a 'season_type' column in stints"
+            )
+        # only meaningful when types are mixed; in a single-type fit a
+        # uniform multiplier would just distort the effective lambda
+        if stints["season_type"].nunique() > 1:
+            mult *= np.where(
+                stints["season_type"] == "Regular Season",
+                1.0,
+                float(playoff_weight),
+            )
+    if garbage_weight != 1.0:
+        if "garbage" not in stints:
+            raise ValueError(
+                "garbage_weight requires a 'garbage' column: re-parse "
+                "stints (delete data/stints, re-run `fablerapm build` — "
+                "the raw cache makes this offline and fast)"
+            )
+        mult *= np.where(
+            stints["garbage"].to_numpy(dtype=bool), float(garbage_weight), 1.0
+        )
+    stints = stints.assign(weight_mult=mult)
+    keep = stints["weight_mult"] > 0
+    if not keep.all():
+        stints = stints.loc[keep].reset_index(drop=True)
+    return stints
 
 
 def _ridge(lam: float) -> Ridge:
@@ -206,41 +300,7 @@ def fit_rapm(
     (see stints.GARBAGE_TIERS): 1.0 keeps them, 0.0 drops them entirely,
     values in between downweight.
     """
-    if decay != 1.0 or playoff_weight != 1.0 or garbage_weight != 1.0:
-        mult = np.ones(len(stints))
-        if decay != 1.0:
-            if "season" not in stints:
-                raise ValueError("decay requires a 'season' column in stints")
-            end_years = stints["season"].map(season_end_year)
-            mult *= float(decay) ** (end_years.max() - end_years).to_numpy(dtype=float)
-        if playoff_weight != 1.0:
-            if "season_type" not in stints:
-                raise ValueError(
-                    "playoff_weight requires a 'season_type' column in stints"
-                )
-            # only meaningful when types are mixed; in a single-type fit a
-            # uniform multiplier would just distort the effective lambda
-            if stints["season_type"].nunique() > 1:
-                mult *= np.where(
-                    stints["season_type"] == "Regular Season",
-                    1.0,
-                    float(playoff_weight),
-                )
-        if garbage_weight != 1.0:
-            if "garbage" not in stints:
-                raise ValueError(
-                    "garbage_weight requires a 'garbage' column: re-parse "
-                    "stints (delete data/stints, re-run `fablerapm build` — "
-                    "the raw cache makes this offline and fast)"
-                )
-            mult *= np.where(
-                stints["garbage"].to_numpy(dtype=bool), float(garbage_weight), 1.0
-            )
-        stints = stints.assign(weight_mult=mult)
-        keep = stints["weight_mult"] > 0
-        if not keep.all():
-            stints = stints.loc[keep].reset_index(drop=True)
-
+    stints = _apply_weight_multipliers(stints, decay, playoff_weight, garbage_weight)
     design = build_design(stints)
     n_players = len(design.player_ids)
 
@@ -265,7 +325,7 @@ def fit_rapm(
     coef = model.coef_ + prior_vec
 
     orapm = coef[:n_players]
-    drapm = -coef[n_players:]  # flip so positive = good defense
+    drapm = -coef[n_players : 2 * n_players]  # flip so positive = good defense
     players = pd.DataFrame(
         {
             "player_id": design.player_ids,
@@ -296,6 +356,128 @@ def fit_rapm(
     return RapmResult(players=players, meta=meta)
 
 
+def fit_interaction_rapm(
+    stints: pd.DataFrame,
+    lam: float | str = "cv",
+    prior: dict[int, tuple[float, float]] | None = None,
+    decay: float = 1.0,
+    playoff_weight: float = 1.0,
+    garbage_weight: float = 1.0,
+) -> RapmResult:
+    """Nonlinear two-phase RAPM (diminishing returns on stacked lineups).
+
+    Phase one is a plain linear RAPM. Its residuals are then regressed on
+    two curvature features — positive-part-squared standardized sums of
+    phase-one lineup talent (offense and defense) — and finally the player
+    coefficients are re-fit against the curvature-adjusted target.
+
+    Methodological details, all load-bearing (each earlier variant failed a
+    controlled synthetic test):
+
+    - The concentration feature is the standardized product of the two
+      largest positive talents in the lineup — high only when two creators
+      share the floor. Squared/summed total-talent features are also high
+      for a lone star's lineups, whose residuals have the opposite sign,
+      cancelling the signal.
+    - Player coefficients are *anchored* (shrunk toward) the linear
+      two-phase estimates while gamma is fit jointly by alternation. The
+      anchor breaks the credit-assignment tie: without it, ridge lets one
+      dense feature act as a penalty-cheap substitute for many shrunk
+      player coefficients and gamma comes out positive (a pure shrinkage
+      artifact); with it, the stacked-row shortfall must flow to gamma.
+    - Signs are clamped to the diminishing-returns hypothesis (offense
+      gamma <= 0, defense gamma >= 0 in points-allowed terms): if the data
+      shows no concavity, gamma clamps to zero and the result degrades
+      gracefully to the linear two-phase fit — the correction can give
+      stars back their stacking penalty, never take credit from them.
+    """
+    stints = _apply_weight_multipliers(stints, decay, playoff_weight, garbage_weight)
+    phase1 = fit_rapm(stints, lam=lam)
+    lam2 = phase1.meta["lambda"]
+    phase1_prior = {
+        int(r.player_id): (float(r.orapm), float(r.drapm))
+        for r in phase1.players.itertuples()
+    }
+    # linear two-phase: shrink toward phase one to undo star compression
+    phase2 = fit_rapm(stints, lam=lam2, prior=phase1_prior)
+    talent = {
+        int(r.player_id): (float(r.orapm), float(r.drapm))
+        for r in phase2.players.itertuples()
+    }
+
+    design = build_design(stints, interaction_talent=talent)
+    n_players = len(design.player_ids)
+    X_lin = design.X[:, : 2 * n_players]
+    F = np.asarray(design.X[:, 2 * n_players :].todense())
+    W = design.weights
+    FtWF = (F.T * W) @ F
+
+    # anchor: user prior if given, else the decompressed phase-2 estimates
+    effective_prior = prior if prior is not None else talent
+    prior_vec = np.zeros(2 * n_players)
+    for j, pid in enumerate(design.player_ids):
+        if pid in effective_prior:
+            o, d = effective_prior[pid]
+            prior_vec[j] = o
+            prior_vec[n_players + j] = -d
+
+    gamma = np.zeros(2)
+    coef = prior_vec
+    intercept = 0.0
+    for _ in range(8):
+        model = _ridge(float(lam2))
+        model.fit(
+            X_lin, design.y - F @ gamma - X_lin @ prior_vec, sample_weight=W
+        )
+        coef = model.coef_ + prior_vec
+        intercept = float(model.intercept_)
+        # residual against the linear part only, so it still contains the
+        # F-explained variation; gamma is re-solved in full, not incremented
+        residual = design.y - intercept - X_lin @ coef
+        new_gamma = np.linalg.solve(FtWF, (F.T * W) @ residual)
+        new_gamma[0] = min(new_gamma[0], 0.0)  # offense: diminishing returns
+        new_gamma[1] = max(new_gamma[1], 0.0)  # defense (points-allowed terms)
+        if np.allclose(new_gamma, gamma, atol=1e-6):
+            gamma = new_gamma
+            break
+        gamma = new_gamma
+
+    orapm = coef[:n_players]
+    drapm = -coef[n_players:]
+    players = pd.DataFrame(
+        {
+            "player_id": design.player_ids,
+            "orapm": orapm,
+            "drapm": drapm,
+            "rapm": orapm + drapm,
+            "off_poss": design.off_poss,
+            "def_poss": design.def_poss,
+        }
+    ).sort_values("rapm", ascending=False, ignore_index=True)
+
+    meta = dict(phase1.meta)
+    meta.update(
+        {
+            "lambda": float(lam2),
+            "phase1_lambda": float(lam2),
+            "intercept": float(model.intercept_),
+            "prior": "custom" if prior else "phase2",
+            "interaction": {
+                # per-100 effect per 1 SD of positive-part-squared lineup
+                # talent; negative offense value = diminishing returns
+                "coef_off_sq": float(gamma[0]),
+                "coef_def_sq": float(gamma[1]),
+                "info": design.interaction_info,
+                "talent": {
+                    str(pid): [round(o, 4), round(d, 4)]
+                    for pid, (o, d) in talent.items()
+                },
+            },
+        }
+    )
+    return RapmResult(players=players, meta=meta)
+
+
 def run_rapm(
     data_dir: Path,
     seasons: list[str],
@@ -311,6 +493,7 @@ def run_rapm(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    interactions: bool = False,
 ) -> list[Path]:
     """Fit RAPM for each requested scope and write CSV + meta JSON.
 
@@ -354,11 +537,15 @@ def run_rapm(
                 prior = None
             else:
                 raise ValueError(f"Unknown prior kind {prior_kind!r}")
-            result = fit_rapm(
-                stints, lam=lam, prior=prior,
-                decay=decay, playoff_weight=playoff_weight,
-                garbage_weight=garbage_weight,
+            fit_kwargs = dict(
+                lam=lam, prior=prior, decay=decay,
+                playoff_weight=playoff_weight, garbage_weight=garbage_weight,
             )
+            if interactions:
+                result = fit_interaction_rapm(stints, **fit_kwargs)
+            else:
+                result = fit_rapm(stints, **fit_kwargs)
+            result.meta["interactions"] = interactions
             result.meta["prior"] = prior_kind
             result.meta["prior_scale"] = (
                 prior_scale if prior_kind in ("two-phase", "last-season") else None
@@ -390,6 +577,8 @@ def run_rapm(
             base = f"rapm_{season_label.replace('-', '_')}_{type_label}"
             if prior_kind != "none":
                 base += f"_{prior_kind.replace('-', '')}"
+            if interactions:
+                base += "_interactions"
             csv_path = out_dir / f"{base}.csv"
             players.to_csv(csv_path, index=False, float_format="%.3f")
             meta = dict(result.meta)

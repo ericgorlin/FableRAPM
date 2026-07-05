@@ -13,9 +13,14 @@ BASE_PER_POSS = 1.10  # league average points per possession
 
 
 def make_league():
-    """Players with true offensive/defensive effects (per 1 possession)."""
-    true_off = rng.normal(0, 0.02, N_PLAYERS)
-    true_def = rng.normal(0, 0.015, N_PLAYERS)  # positive = allows more
+    """Players with true offensive/defensive effects (per 1 possession).
+
+    Deterministic per call (fresh generator) so test files can share it
+    without coupling through module RNG state.
+    """
+    r = np.random.default_rng(7)
+    true_off = r.normal(0, 0.02, N_PLAYERS)
+    true_def = r.normal(0, 0.015, N_PLAYERS)  # positive = allows more
     return true_off, true_def
 
 

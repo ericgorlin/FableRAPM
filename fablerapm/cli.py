@@ -90,6 +90,7 @@ def cmd_rapm(args) -> int:
         decay=args.decay,
         playoff_weight=args.playoff_weight,
         garbage_weight=args.garbage_weight,
+        interactions=args.interactions,
     )
     for path in written:
         print(f"wrote {path}")
@@ -178,6 +179,8 @@ def cmd_evaluate(args) -> int:
         # SPM prior comes from features + a saved model, independent of the
         # train/holdout stint split, so it can't leak holdout outcomes
         variants["spm"] = lambda train: spm_prior(data_dir, seasons, season_types)
+    if args.interactions:
+        variants["interactions"] = {"prior_fn": None, "interactions": True}
 
     import pandas as pd
 
@@ -295,6 +298,11 @@ def main(argv=None) -> int:
         help="Weight multiplier for garbage-time stints: 1.0 keeps (default), "
         "0 drops, in between downweights",
     )
+    p_rapm.add_argument(
+        "--interactions", action="store_true",
+        help="Nonlinear two-phase RAPM: adds squared-lineup-talent terms so "
+        "diminishing returns of stacked lineups aren't deducted from stars",
+    )
     p_rapm.set_defaults(func=cmd_rapm)
 
     p_val = sub.add_parser(
@@ -347,6 +355,11 @@ def main(argv=None) -> int:
     p_eval.add_argument(
         "--spm", action="store_true",
         help="Also evaluate the trained SPM prior (needs spm-train first)",
+    )
+    p_eval.add_argument(
+        "--interactions", action="store_true",
+        help="Also evaluate nonlinear two-phase RAPM (lineup-talent "
+        "interaction terms)",
     )
     p_eval.add_argument(
         "--decays", type=float, nargs="*", default=[1.0],
