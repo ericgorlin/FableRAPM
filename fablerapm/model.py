@@ -380,8 +380,27 @@ def fit_interaction_rapm(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    offense_curvature: str = "diminishing",
+    defense_curvature: str = "diminishing",
 ) -> RapmResult:
     """Nonlinear two-phase RAPM (diminishing returns on stacked lineups).
+
+    ``offense_curvature`` / ``defense_curvature`` control the sign
+    constraints on each side's concentration terms: "diminishing" (concave
+    only — offense gammas <= 0 in points-scored terms, defense gammas >= 0
+    in points-allowed terms), "free" (either sign), or "none" (terms off).
+
+    Defaults are "diminishing" as *robustness*, not dogma: in controlled
+    synthetic tests the unconstrained estimate is biased toward fake
+    convexity (ridge under-predicts talented lineups, and a dense feature
+    is a penalty-cheap substitute for many shrunk player coefficients), and
+    the three basis features are collinear, so free-signed least squares
+    also produces large offsetting coefficients. A free fit can *predict*
+    better while corrupting *attribution* — arbitrate with evaluate, and
+    treat free-signed gammas with suspicion unless they replicate across
+    seasons/seeds. Offense has a hard saturation mechanism (one ball, usage
+    capped at 100%); defense arguably has weakest-link dynamics instead, so
+    "free" is most defensible there.
 
     Phase one is a plain linear RAPM. Its residuals are then regressed on
     two curvature features — positive-part-squared standardized sums of
@@ -429,12 +448,35 @@ def fit_interaction_rapm(
     F = np.asarray(design.X[:, 2 * n_players :].todense())
     W = design.weights
     sw = np.sqrt(W)
-    # sign constraints encode concavity only: offensive concentration can
-    # only subtract points (gamma <= 0); defensive concentration can only
-    # raise opponent scoring relative to linear (gamma >= 0, points-allowed
-    # terms). Solved as NNLS after flipping the offense block.
-    signs = np.concatenate([-np.ones(n_feat), np.ones(n_feat)])
-    A = (F * signs) * sw[:, None]
+    # bounds encode the curvature hypotheses: offensive concentration can
+    # only subtract points (gamma <= 0); the defensive block's constraint
+    # is configurable (points-allowed terms: >= 0 diminishing, free, or 0)
+    inf = np.inf
+    # (lower, upper) per mode, in each side's natural sign convention:
+    # offense concave = gamma <= 0 (points scored), defense concave =
+    # gamma >= 0 (points allowed)
+    mode_bounds = {
+        "off": {
+            "diminishing": (-inf, 0.0),
+            "free": (-inf, inf),
+            "none": (-1e-12, 1e-12),
+        },
+        "def": {
+            "diminishing": (0.0, inf),
+            "free": (-inf, inf),
+            "none": (-1e-12, 1e-12),
+        },
+    }
+    for side, mode in (("off", offense_curvature), ("def", defense_curvature)):
+        if mode not in mode_bounds[side]:
+            raise ValueError(f"Unknown {side} curvature mode {mode!r}")
+    o_lb, o_ub = mode_bounds["off"][offense_curvature]
+    d_lb, d_ub = mode_bounds["def"][defense_curvature]
+    bounds = (
+        np.array([o_lb] * n_feat + [d_lb] * n_feat),
+        np.array([o_ub] * n_feat + [d_ub] * n_feat),
+    )
+    A = F * sw[:, None]
 
     # anchor: user prior if given, else the decompressed phase-2 estimates
     effective_prior = prior if prior is not None else talent
@@ -445,7 +487,7 @@ def fit_interaction_rapm(
             prior_vec[j] = o
             prior_vec[n_players + j] = -d
 
-    from scipy.optimize import nnls
+    from scipy.optimize import lsq_linear
 
     gamma = np.zeros(2 * n_feat)
     coef = prior_vec
@@ -460,7 +502,7 @@ def fit_interaction_rapm(
         # residual against the linear part only, so it still contains the
         # F-explained variation; gamma is re-solved in full, not incremented
         residual = design.y - intercept - X_lin @ coef
-        new_gamma = signs * nnls(A, residual * sw)[0]
+        new_gamma = lsq_linear(A, residual * sw, bounds=bounds).x
         if np.allclose(new_gamma, gamma, atol=1e-6):
             gamma = new_gamma
             break
@@ -490,6 +532,8 @@ def fit_interaction_rapm(
                 # per-100 effect per 1 SD of each concentration feature;
                 # negative offense values = diminishing returns
                 "features": INTERACTION_FEATURES,
+                "offense_curvature": offense_curvature,
+                "defense_curvature": defense_curvature,
                 "gamma_off": {
                     f: float(g) for f, g in zip(INTERACTION_FEATURES, gamma[:n_feat])
                 },
@@ -523,6 +567,8 @@ def run_rapm(
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
     interactions: bool = False,
+    offense_curvature: str = "diminishing",
+    defense_curvature: str = "diminishing",
 ) -> list[Path]:
     """Fit RAPM for each requested scope and write CSV + meta JSON.
 
@@ -571,7 +617,12 @@ def run_rapm(
                 playoff_weight=playoff_weight, garbage_weight=garbage_weight,
             )
             if interactions:
-                result = fit_interaction_rapm(stints, **fit_kwargs)
+                result = fit_interaction_rapm(
+                    stints,
+                    offense_curvature=offense_curvature,
+                    defense_curvature=defense_curvature,
+                    **fit_kwargs,
+                )
             else:
                 result = fit_rapm(stints, **fit_kwargs)
             result.meta["interactions"] = interactions

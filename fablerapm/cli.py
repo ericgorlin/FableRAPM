@@ -91,6 +91,8 @@ def cmd_rapm(args) -> int:
         playoff_weight=args.playoff_weight,
         garbage_weight=args.garbage_weight,
         interactions=args.interactions,
+        offense_curvature=args.offense_curvature,
+        defense_curvature=args.defense_curvature,
     )
     for path in written:
         print(f"wrote {path}")
@@ -300,8 +302,23 @@ def main(argv=None) -> int:
     )
     p_rapm.add_argument(
         "--interactions", action="store_true",
-        help="Nonlinear two-phase RAPM: adds squared-lineup-talent terms so "
-        "diminishing returns of stacked lineups aren't deducted from stars",
+        help="Nonlinear two-phase RAPM: learned talent-concentration terms "
+        "so diminishing returns of stacked lineups aren't deducted from "
+        "stars",
+    )
+    p_rapm.add_argument(
+        "--offense-curvature",
+        choices=["diminishing", "free", "none"], default="diminishing",
+        help="Sign constraint on offensive concentration terms: diminishing "
+        "(concave only, default — robust to the shrinkage artifact), free "
+        "(learn sign from data; validate with evaluate), none (terms off)",
+    )
+    p_rapm.add_argument(
+        "--defense-curvature",
+        choices=["diminishing", "free", "none"], default="diminishing",
+        help="Same for defensive terms (defense may have weakest-link "
+        "synergy rather than diminishing returns, so free is most "
+        "defensible here)",
     )
     p_rapm.set_defaults(func=cmd_rapm)
 
