@@ -178,6 +178,102 @@ cross-checks stint totals against the official game-log scores (an
 independent source), coverage against the schedule, and league points/100
 plausibility — all offline.
 
+## The full model, in three steps
+
+`fablerapm rapm --interactions` implements:
+
+1. **Base + prior-informed RAPM**: plain linear RAPM, then a second linear
+   fit shrinking toward the first (decompresses stars that flat shrinkage
+   compresses). With `--prior spm|last-season`, that prior anchors instead.
+2. **Learn interaction terms**: sign-constrained least squares of the
+   anchored fit's residuals on the talent-concentration basis (per side).
+3. **Second-phase RAPM with 1+2 as input**: player coefficients re-fit
+   against the interaction-adjusted target, shrinking toward step 1.
+
+Steps 2–3 alternate to convergence. Every knob is a flag; `evaluate` is the
+referee for all of them.
+
+## Suggested experiments (in order)
+
+```bash
+pip install -e ".[dev]" && pytest        # 39 offline tests, no network
+fablerapm smoke-test                     # ~8 live API requests, end-to-end
+```
+
+**1. First real data.** Build a recent season, verify it, look at it:
+
+```bash
+fablerapm build --seasons 2023-24            # ~1300 games, ~25 min
+fablerapm validate --seasons 2023-24         # scores vs official game logs
+fablerapm rapm --seasons 2023-24 --min-poss 2000
+```
+
+Sanity check: the top of the regular-season CSV should be recognizable
+MVP-tier names, league avg ~115 pts/100 in `meta.json`, CV lambda usually
+in the 1000s for a single season.
+
+**2. Tune the free parameters on held-out games** (expect small gaps —
+stint outcomes are noisy; re-run with a few `--seed`s before believing a
+winner):
+
+```bash
+fablerapm build --seasons 2021-22:2023-24
+fablerapm evaluate --seasons 2021-22:2023-24 \
+    --decays 1.0 0.9 0.75 --garbage-weights 1.0 0.5 0.0 --holdout-no-garbage
+```
+
+**3. Priors.** Compare stabilizers on a single noisy season:
+
+```bash
+fablerapm evaluate --seasons 2023-24 --two-phase-scales 0.5 1.0 \
+    --last-season-scales 0.5 0.7          # needs 2022-23 built
+fablerapm features --seasons 2015-16:2023-24     # box + tracking, 8 req/season
+fablerapm spm-train --seasons 2015-16:2022-23 --season-types regular
+fablerapm evaluate --seasons 2023-24 --spm
+fablerapm rapm --seasons 2023-24 --prior spm     # writes *_spm.csv
+```
+
+**4. The LeBron/KG experiment** (diminishing returns on stacked stars).
+Build 2003-04 through 2013-14, then compare pooled fits:
+
+```bash
+fablerapm build --seasons 2003-04:2013-14        # long build, resumable
+fablerapm rapm --seasons 2003-04:2013-14 --pool --combine-types --decay 0.9
+fablerapm rapm --seasons 2003-04:2013-14 --pool --combine-types --decay 0.9 \
+    --interactions
+```
+
+Look at: (a) LeBron vs KG ordering in the two CSVs, (b) LeBron's Miami-era
+single seasons (2010-11:2013-14) with and without `--interactions`,
+(c) `gamma_off` in the meta — nonzero values mean the data shows concave
+offensive production (per 1 SD of each concentration feature, per 100).
+Then let holdout arbitrate: `evaluate --seasons ... --interactions`.
+
+**5. Curvature signs.** The defaults constrain to diminishing returns
+because the unconstrained estimator is biased toward fake convexity by
+ridge shrinkage (demonstrated in `tests/test_interactions.py`) and the
+collinear basis makes free-signed fits unstable. To learn signs from data
+anyway — most defensible on defense, where weakest-link synergy is
+plausible:
+
+```bash
+fablerapm rapm --seasons ... --interactions --defense-curvature free
+fablerapm rapm --seasons ... --interactions --offense-curvature free  # skeptically
+```
+
+Believe a free-signed gamma only if it replicates across seasons and wins
+in `evaluate`. The principled upgrade (future work): null calibration —
+simulate additive data from the fitted linear model, re-fit the free
+interaction, and require the real gamma to fall outside that null band.
+
+**6. Full history**, once happy with settings:
+
+```bash
+fablerapm build                    # 1996-97 -> present, many hours, resumable
+fablerapm validate
+fablerapm rapm                     # per-season, both season types
+```
+
 ## Data layout
 
 ```
