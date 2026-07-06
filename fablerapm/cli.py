@@ -432,7 +432,9 @@ def main(argv=None) -> int:
     )
     p_eval.add_argument(
         "--spm", action="store_true",
-        help="Also evaluate the trained SPM prior (needs spm-train first)",
+        help="Also evaluate the trained SPM prior (needs spm-train first). "
+        "IMPORTANT: train the SPM on seasons disjoint from the evaluated "
+        "ones — its RAPM targets otherwise saw these games",
     )
     p_eval.add_argument(
         "--interactions", action="store_true",

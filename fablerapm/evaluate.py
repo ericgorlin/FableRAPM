@@ -98,8 +98,10 @@ def evaluate_variants(
         train["game_id"].nunique(), test["game_id"].nunique(), len(test),
     )
 
-    y = 100.0 * test["points"].to_numpy() / test["poss"].to_numpy()
-    baseline_pred = np.full(len(test), np.average(y, weights=test["poss"]))
+    # baseline mean from TRAIN games, like every other variant
+    train_nz = train[train["poss"] > 0]
+    y_train = 100.0 * train_nz["points"].to_numpy() / train_nz["poss"].to_numpy()
+    baseline_pred = np.full(len(test), np.average(y_train, weights=train_nz["poss"]))
     rows = [{
         "variant": "intercept-only",
         "lambda": np.nan,
