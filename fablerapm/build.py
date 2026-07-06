@@ -32,13 +32,30 @@ def _load_manifest(path: Path) -> dict:
 
 def _save_manifest(path: Path, manifest: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    tmp.replace(path)
 
 
-def _load_stints(path: Path) -> pd.DataFrame:
-    if path.exists():
-        return pd.read_parquet(path)
-    return pd.DataFrame(columns=STINT_COLUMNS)
+def _load_stints(path: Path, manifest: dict) -> pd.DataFrame:
+    """Load stored stints, reconciled against the manifest.
+
+    The parquet is written before the manifest, so after a hard crash the
+    parquet may contain games the manifest doesn't record as processed.
+    Dropping those rows here makes re-processing them safe (no duplicates).
+    """
+    if not path.exists():
+        return pd.DataFrame(columns=STINT_COLUMNS)
+    stints = pd.read_parquet(path)
+    known = stints["game_id"].isin(manifest["processed"])
+    if not known.all():
+        logger.warning(
+            "Dropping %d stint rows from %d game(s) not in the manifest "
+            "(likely an interrupted run); they will be re-processed",
+            int((~known).sum()), stints.loc[~known, "game_id"].nunique(),
+        )
+        stints = stints.loc[known].reset_index(drop=True)
+    return stints
 
 
 def build_season(
@@ -74,7 +91,7 @@ def build_season(
         len(manifest["processed"]), len(manifest["failed"]), len(todo),
     )
 
-    stints = _load_stints(spath)
+    stints = _load_stints(spath, manifest)
     new_rows: list[dict] = []
     started = time.monotonic()
 
@@ -87,7 +104,9 @@ def build_season(
             )
             new_rows = []
             spath.parent.mkdir(parents=True, exist_ok=True)
-            stints.to_parquet(spath, index=False)
+            tmp = spath.with_suffix(".tmp")
+            stints.to_parquet(tmp, index=False)
+            tmp.replace(spath)
         _save_manifest(mpath, manifest)
 
     for i, game_id in enumerate(todo, 1):

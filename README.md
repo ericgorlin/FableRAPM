@@ -4,8 +4,9 @@ NBA RAPM (Regularized Adjusted Plus-Minus) pipeline with **offensive and
 defensive splits per 100 possessions**, for every season with play-by-play
 data (1996-97 to present), regular season **and** playoffs.
 
-No box-score approximations anywhere in the data path: possessions, lineups,
-and points are parsed exactly from raw stats.nba.com play-by-play (period
+No box-score approximations anywhere in the data path: play-by-play-derived
+lineup attribution with audited score reconciliation — possessions, lineups,
+and points are parsed from raw stats.nba.com play-by-play (period
 starters, substitutions during free throws, and possession-counting edge
 cases are resolved by [pbpstats](https://github.com/dblackrun/pbpstats),
 which was built for exactly this). Raw API responses are cached on disk, so

@@ -132,7 +132,13 @@ def tune(
     if lam == "cv":
         lam, _ = cross_validate_lambda(build_design(stints))
     cfg = dict(DEFAULT_CONFIG, **{"lambda": float(lam)})
-    splits = [holdout_split(stints, test_frac, seed) for seed in range(n_seeds)]
+    # zero-possession rows (orphaned technical FTs) can't be scored
+    splits = [
+        (train, test[test["poss"] > 0].reset_index(drop=True))
+        for train, test in (
+            holdout_split(stints, test_frac, seed) for seed in range(n_seeds)
+        )
+    ]
 
     history = []
     best = _score(stints, cfg, splits, data_dir, seasons, season_types)

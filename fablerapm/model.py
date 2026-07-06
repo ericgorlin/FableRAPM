@@ -254,8 +254,16 @@ def cross_validate_lambda(
     design: Design,
     lambdas=DEFAULT_LAMBDA_GRID,
     n_folds: int = 5,
+    y: np.ndarray | None = None,
 ) -> tuple[float, list[dict]]:
-    """Pick ridge strength by game-grouped K-fold CV (weighted MSE)."""
+    """Pick ridge strength by game-grouped K-fold CV (weighted MSE).
+
+    ``y`` overrides ``design.y`` so prior-adjusted fits select lambda for
+    the problem actually being solved (residuals around the prior), not
+    for a zero-centered fit.
+    """
+    if y is None:
+        y = design.y
     n_groups = len(np.unique(design.groups))
     n_folds = min(n_folds, n_groups)
     if n_folds < 2:
@@ -270,12 +278,12 @@ def cross_validate_lambda(
             model = _ridge(lam)
             model.fit(
                 design.X[train_idx],
-                design.y[train_idx],
+                y[train_idx],
                 sample_weight=design.weights[train_idx],
             )
             pred = model.predict(design.X[val_idx])
             fold_mse.append(
-                _weighted_mse(design.y[val_idx], pred, design.weights[val_idx])
+                _weighted_mse(y[val_idx], pred, design.weights[val_idx])
             )
         table.append({"lambda": lam, "cv_mse": float(np.mean(fold_mse))})
         logger.info("lambda=%g: CV weighted MSE=%.4f", lam, table[-1]["cv_mse"])
@@ -335,7 +343,7 @@ def fit_rapm(
 
     cv_table = None
     if lam == "cv":
-        lam, cv_table = cross_validate_lambda(design, lambdas, n_folds)
+        lam, cv_table = cross_validate_lambda(design, lambdas, n_folds, y=y)
 
     model = _ridge(float(lam))
     model.fit(design.X, y, sample_weight=design.weights)
