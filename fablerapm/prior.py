@@ -22,7 +22,14 @@ SPM_ALPHAS = [0.1, 1.0, 10.0, 100.0, 1000.0]
 
 @dataclass
 class SpmModel:
-    """Ridge mapping standardized player features -> (ORAPM, DRAPM)."""
+    """Ridge mapping standardized player features -> (ORAPM, DRAPM).
+
+    ``train_seasons`` / ``train_season_types`` are provenance: the seasons
+    whose RAPM fits produced the training targets. ``spm_prior`` warns when
+    the model is applied to a season it was trained on, since its targets
+    saw those games and any evaluation there is optimistic. None on
+    artifacts saved before provenance existed.
+    """
 
     feature_cols: list[str]
     mean: np.ndarray
@@ -33,6 +40,8 @@ class SpmModel:
     intercept_d: float
     alpha_o: float
     alpha_d: float
+    train_seasons: list[str] | None = None
+    train_season_types: list[str] | None = None
 
     def to_json(self) -> str:
         d = {k: (v.tolist() if isinstance(v, np.ndarray) else v)
@@ -215,6 +224,8 @@ def train_spm(
     features = load_features(data_dir, train_seasons, season_types)
 
     model = fit_spm(features, targets)
+    model.train_seasons = list(train_seasons)
+    model.train_season_types = list(season_types)
     path = spm_model_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(model.to_json())
@@ -234,5 +245,15 @@ def spm_prior(
             f"No SPM model at {path}. Run `fablerapm spm-train` first."
         )
     model = SpmModel.from_json(path.read_text())
+    if model.train_seasons:
+        overlap = sorted(set(model.train_seasons) & set(seasons))
+        if overlap:
+            logger.warning(
+                "SPM prior was trained on %s, which overlaps the current "
+                "scope: its RAPM targets saw these games, so any holdout "
+                "evaluation here is optimistic. Retrain on disjoint seasons "
+                "(`fablerapm spm-train`).",
+                ", ".join(overlap),
+            )
     features = load_features(data_dir, seasons, season_types)
     return predict_spm(model, features)

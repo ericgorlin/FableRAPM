@@ -115,11 +115,22 @@ priors are built in:
 - **Two-phase RAPM** (`--prior two-phase`): phase one is a plain RAPM; phase
   two re-fits shrinking toward it, letting star coefficients escape flat
   shrinkage (diminishing-returns compression). `--prior-scale` scales the
-  prior. Self-contained — needs only stint data.
+  prior. Self-contained — needs only stint data. Precisely speaking this is
+  *iterated ridge* (relaxed shrinkage / decompression), not an independent
+  prior: the shrinkage target is estimated from the same data, and along
+  each ridge eigendirection the two-phase estimate has total shrinkage
+  `s(2-s)` where plain ridge has `s` — always milder. Whether that milder,
+  spectrum-reshaped shrinkage actually predicts better than plain ridge at
+  *its own* best lambda is an empirical question; `tune` includes a lambda
+  grid as a search coordinate precisely so a two-phase winner has to beat
+  a properly retuned plain ridge, not just the baseline lambda.
 - **SPM prior** (`--prior spm`): a statistical plus-minus built from
   per-player **box score + player-tracking** features (drives, touches,
   passing, contested shots, rebounding, speed/distance — tracking exists
-  2013-14+; earlier seasons fall back to box/advanced only).
+  2013-14+; earlier seasons fall back to box/advanced only). The saved
+  model artifact records its training seasons, and `--prior spm` warns
+  automatically if you apply it to a season it was trained on (its RAPM
+  targets saw those games).
 - **Last-season prior** (`--prior last-season --prior-scale 0.7`): the
   previous season's RAPM, scaled, as the shrinkage target.
 - **Nonlinear two-phase** (`--interactions`): linear two-phase plus a
@@ -174,10 +185,22 @@ fablerapm evaluate --seasons 2022-23:2024-25 \
 on the train side, and reports holdout MSE against an intercept-only
 baseline, sorted best-first over the full grid of decay/garbage/playoff
 weights — the harness for learning every free parameter from data instead
-of guessing it. After building a season, run `fablerapm validate`: it
-cross-checks stint totals against the official game-log scores (an
-independent source), coverage against the schedule, and league points/100
-plausibility — all offline.
+of guessing it. `--split chrono` holds out the *latest* games and trains
+only on earlier ones (forward-chaining) — the honest protocol when the
+model's job is current ratings or upcoming games, and what `tune` does by
+default.
+
+After building a season, run `fablerapm validate`: it cross-checks stint
+totals against the official game-log scores (an independent source),
+coverage against the schedule, and league points/100 plausibility — all
+offline. Scope of that claim: reconciliation proves the *bookkeeping* is
+right (every point in every game is attributed to some lineup, summing
+exactly to official totals); it cannot by itself prove every point went to
+the *correct* five-man lineup — a substitution-timing bug could in
+principle misattribute events while preserving game totals. Lineup-level
+attribution rests on pbpstats' event parsing plus this repo's fixture-game
+test; a set of manually-verified golden games covering nasty edge cases is
+the TODO that would close the gap.
 
 ## The full model, in three steps
 
@@ -217,7 +240,7 @@ present, hours, resumable) followed by `validate` and
 ## Suggested experiments (in order)
 
 ```bash
-pip install -e ".[dev]" && pytest        # 39 offline tests, no network
+pip install -e ".[dev]" && pytest        # 51 offline tests, no network
 fablerapm smoke-test                     # ~8 live API requests, end-to-end
 ```
 
@@ -268,7 +291,10 @@ Look at: (a) LeBron vs KG ordering in the two CSVs, (b) LeBron's Miami-era
 single seasons (2010-11:2013-14) with and without `--interactions`,
 (c) `gamma_off` in the meta — nonzero values mean the data shows concave
 offensive production (per 1 SD of each concentration feature, per 100).
-Then let holdout arbitrate: `evaluate --seasons ... --interactions`.
+Then let holdout arbitrate (`evaluate --seasons ... --interactions`), and
+before believing any curvature is real, run the null calibration
+(`calibrate-curvature`, experiment 5): a nonzero gamma only counts if it
+falls outside what this estimator produces on additive data.
 
 **5. Curvature signs.** The defaults constrain to diminishing returns
 because the unconstrained estimator is biased toward fake convexity by
@@ -283,19 +309,48 @@ fablerapm rapm --seasons ... --interactions --offense-curvature free  # skeptica
 ```
 
 Believe a free-signed gamma only if it replicates across seasons and wins
-in `evaluate`. The principled upgrade (future work): null calibration —
-simulate additive data from the fitted linear model, re-fit the free
-interaction, and require the real gamma to fall outside that null band.
+in `evaluate`. The principled arbiter is implemented: **null calibration**
+(`fablerapm calibrate-curvature`) simulates additive (zero-curvature)
+copies of your data from the fitted linear model, re-runs the entire
+free-signed interaction pipeline on each, and reports which real-data
+curvature values fall outside the estimator's own null band:
+
+```bash
+fablerapm calibrate-curvature --seasons 2013-14 --sims 200
+```
+
+The headline line is the per-side *curvature score* (fitted interaction
+contribution, in points/100, at top-decile-concentration lineups) — the
+individual gammas sit on a collinear basis and trade off against each
+other, so read them only for color. A score outside the null band means
+the additive model is genuinely missing something; treat the side it lands
+on with care (credit assignment between offense and defense blocks is the
+least identified part — see `calibrate.py`), and still demand replication
+across seasons before calling it basketball.
 
 **5b. Or learn everything at once.** `tune` runs greedy coordinate descent
 over all tunable parameters (garbage weight, decay, playoff weight, prior
-kind + scale, interactions + defense curvature; lambda by CV), scored on
-held-out games averaged over several seeds, and saves the winner:
+kind + scale, interactions + defense curvature, and ridge lambda over a
+multiplier grid around the CV pick), scored on held-out games averaged
+over several inner splits, and saves the winner:
 
 ```bash
 fablerapm tune --seasons 2022-23:2024-25 --seeds 3
 fablerapm rapm --seasons 2022-23:2024-25 --pool --tuned
 ```
+
+The evaluation is **nested and chronological by default**: an outer block
+of the latest games (`--outer-frac`, default 20%) is set aside before any
+tuning; the search selects on forward-chaining inner splits of the
+remaining games (train strictly earlier than test; `--split random`
+restores seeded shuffles); and at the end the winner and the untouched
+default config are each scored once on the outer block. `outer_mse` vs
+`outer_default_mse` in the output is the unbiased report of what tuning
+bought — the inner MSE chose the winner, so it is optimistic as an
+estimate and only valid for ranking. Lambda is searched *last* in each
+pass so it re-tunes for whichever model family won (a two-phase or
+interaction winner has to beat plain ridge at its own best lambda);
+`--passes 2` lets the family choice react to the re-tuned lambda in turn.
 
 The full search history is in `data/results/tuned_config.json`. Caveats:
 holdout gaps between reasonable settings are small, so prefer more
@@ -319,13 +374,18 @@ fablerapm rapm                     # per-season, both season types
 The goal state is that *no* configuration is a human decision. What still
 stands between here and there:
 
-1. **Null calibration for curvature signs** (biggest one — detailed below).
-2. **Learn the garbage-time rule from data**: the margin/time tiers are
+1. **Learn the garbage-time rule from data**: the margin/time tiers are
    parse-time constants baked into a boolean. Store the possession's
    start margin and seconds remaining on each stint row instead, and let
    `tune` learn a smooth downweighting function of (margin, time) — turns
    a data definition into a fit-time parameter. Requires a schema change +
    re-parse (offline, from the raw cache).
+2. **Golden games for lineup attribution**: score reconciliation proves
+   totals, not attribution (see the validate section). Hand-verify a small
+   set of games covering the nasty edge cases — simultaneous substitutions,
+   technical/flagrant free throws, substitutions between free throws,
+   offensive rebounds and possession continuation, end-of-quarter events,
+   overturned calls — and pin their exact stint rows as fixtures.
 3. **Own box-score/tracking aggregation from play-by-play**: SPM features
    currently come from official full-season aggregates, so they include
    garbage time and can't be decayed or filtered consistently with the
@@ -333,52 +393,28 @@ stands between here and there:
    attribution we already use; aggregating them ourselves makes features
    consistent with every weighting knob and extends "tracking-adjacent"
    features to all seasons.
-4. **Nested holdout for tune**: tune selects on the same holdout games it
-   reports; add an outer untouched test split so the reported MSE of the
-   winning config is unbiased (currently fine for *ranking* configs,
-   optimistic as an *estimate*).
-5. **Richer interaction basis**: splines/kernels over lineup talent
+4. **Richer interaction basis**: splines/kernels over lineup talent
    composition instead of three hand-picked convex shapes; the basis is a
    one-line list (`model.INTERACTION_FEATURES`), and tune/evaluate already
    referee additions. Position/role-aware concentration (creator vs big)
    once SPM features exist per player.
-6. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
+5. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
    / opponent FT% with expected values at parse time (schema addition),
    then let tune decide if it helps.
-7. **Parallel re-parse** (`build --workers N`): pure-Python possession
+6. **Parallel re-parse** (`build --workers N`): pure-Python possession
    parsing dominates cache re-parses of 40k games.
-8. **Aging curve in the last-season prior**: scale by a learned age curve
+7. **Aging curve in the last-season prior**: scale by a learned age curve
    rather than one global `prior_scale`.
+8. **Residual-resampling null option**: `calibrate-curvature` simulates
+   Poisson stint outcomes, which slightly understate real per-possession
+   scoring variance (2s and 3s); a resampled-residual generator would match
+   dispersion exactly. (Conservative in the safe direction as-is.)
 
-## TODO: null calibration for curvature signs
-
-The one free parameter still not honestly learnable from data is the
-*direction* of the interaction (diminishing returns vs synergy). The naive
-free-signed fit is biased: ridge shrinkage under-predicts talented
-lineups, so any talent-derived feature picks up fake positive curvature
-(demonstrated in `tests/test_interactions.py` — a controlled world with
-truly negative curvature yields a confidently positive unconstrained
-estimate), and a dense feature also substitutes penalty-cheaply for many
-shrunk player coefficients. The sign constraints (`--offense-curvature` /
-`--defense-curvature`, default `diminishing`) are the current defense.
-
-The principled fix — **null calibration** — is not yet implemented:
-
-1. Fit the linear model; simulate synthetic seasons from it (additive
-   truth, so real curvature = 0 by construction, matching real possession
-   counts and lineups; Poisson or resampled stint outcomes).
-2. Re-fit the free-signed interaction on each simulation → the null
-   distribution of each gamma under "no curvature + this estimator's
-   biases".
-3. On real data, report a free-signed gamma as a finding only where it
-   falls outside the null band (and subtract the null mean as a bias
-   correction).
-
-This would make even the sign a data-driven conclusion, and would slot in
-as a `fablerapm calibrate-curvature` command reusing `fit_interaction_rapm`
-with `offense_curvature="free", defense_curvature="free"` on simulated
-stints. Until then, treat free-signed gammas as suggestive only if they
-replicate across seasons and win in `evaluate`.
+Done and moved out of this list: null calibration for curvature signs
+(`fablerapm calibrate-curvature`, see experiment 5) and nested +
+chronological holdout evaluation for `tune` (outer untouched test block,
+forward-chaining inner splits, lambda in the search grid — see experiment
+5b).
 
 ## Data layout
 

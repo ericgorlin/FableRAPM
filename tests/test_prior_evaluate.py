@@ -41,9 +41,19 @@ def test_spm_fit_predict_roundtrip():
     d_pred = np.array([prior[i + 1][1] for i in range(N_PLAYERS)])
     assert np.corrcoef(o_pred, 100 * true_off)[0, 1] > 0.9
     assert np.corrcoef(d_pred, -100 * true_def)[0, 1] > 0.9
-    # serialization roundtrip
+    # serialization roundtrip, incl. provenance fields
+    model.train_seasons = ["2021-22", "2022-23"]
+    model.train_season_types = ["Regular Season"]
     restored = SpmModel.from_json(model.to_json())
     assert predict_spm(restored, features)[1] == prior[1]
+    assert restored.train_seasons == ["2021-22", "2022-23"]
+    # artifacts saved before provenance existed still load
+    import json as _json
+
+    legacy = _json.loads(model.to_json())
+    del legacy["train_seasons"], legacy["train_season_types"]
+    old = SpmModel.from_json(_json.dumps(legacy))
+    assert old.train_seasons is None
     # predicting with a missing feature column still works (treated as mean)
     slim = features.drop(columns=["pt_defense_CONTESTED_SHOTS"])
     assert np.isfinite(predict_spm(model, slim)[1]).all()

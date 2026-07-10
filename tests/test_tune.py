@@ -31,15 +31,24 @@ def test_tune_writes_config_and_rapm_uses_it(tmp_path):
     )
     assert tuned_config_path(data_dir).exists()
     # searched coordinates present, incl. last-season prior (2023-24 exists)
+    # and the lambda multiplier grid
     notes = {h["note"] for h in result["history"]}
-    assert {"baseline", "garbage_weight", "prior", "interactions"} <= notes
+    assert {"baseline", "garbage_weight", "prior", "interactions", "lambda"} <= notes
     assert any(
         h["config"]["prior"] == "last-season" for h in result["history"]
     )
-    assert np.isfinite(result["holdout_mse"])
+    assert np.isfinite(result["inner_mse"])
+    assert result["holdout_mse"] == result["inner_mse"]  # legacy alias
+
+    # nested evaluation: the outer block was never used for selection, and
+    # its scores are reported for tuned vs default vs intercept-only
+    assert result["split"] == "chrono"
+    for key in ("outer_mse", "outer_default_mse", "outer_intercept_mse"):
+        assert np.isfinite(result[key])
 
     cfg = load_tuned_config(data_dir)
-    assert cfg["lambda"] == 1000.0
+    # lambda is searched over multipliers of the base CV/fixed value
+    assert cfg["lambda"] in {1000.0 * m for m in (0.25, 0.5, 1.0, 2.0, 4.0)}
     assert set(cfg) >= {"garbage_weight", "decay", "prior", "interactions"}
 
     rc = main([
@@ -49,3 +58,15 @@ def test_tune_writes_config_and_rapm_uses_it(tmp_path):
     ])
     assert rc == 0
     assert list((data_dir / "results").glob("rapm_2024_25_*.csv"))
+
+
+def test_tune_random_split_without_outer_holdout(tmp_path):
+    data_dir = tmp_path / "data"
+    seed_two_seasons(data_dir)
+    result = tune(
+        data_dir, ["2024-25"], ["Regular Season"],
+        n_seeds=2, lam=1000.0, split="random", outer_frac=0.0,
+    )
+    assert result["split"] == "random"
+    assert "outer_mse" not in result
+    assert np.isfinite(result["inner_mse"])

@@ -128,9 +128,35 @@ def cmd_tune(args) -> int:
         data_dir, seasons, season_types,
         n_seeds=args.seeds, test_frac=args.test_frac,
         passes=args.passes, lam=lam,
+        split=args.split, outer_frac=args.outer_frac,
     )
     print(json.dumps({k: v for k, v in result.items() if k != "history"}, indent=1))
+    if "outer_mse" in result:
+        print(
+            f"untouched outer games: tuned {result['outer_mse']:.4f} vs "
+            f"default {result['outer_default_mse']:.4f} vs intercept-only "
+            f"{result['outer_intercept_mse']:.4f} (lower is better; this is "
+            "the unbiased number — the inner MSE selected the winner)"
+        )
     print("use it with: fablerapm rapm --tuned")
+    return 0
+
+
+def cmd_calibrate_curvature(args) -> int:
+    from .calibrate import format_report, run_calibration
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+    report, path = run_calibration(
+        data_dir, seasons, season_types,
+        lam=lam, n_sims=args.sims, seed=args.seed, alpha=args.alpha,
+        offense_curvature=args.offense_curvature,
+        defense_curvature=args.defense_curvature,
+        decay=args.decay, playoff_weight=args.playoff_weight,
+        garbage_weight=args.garbage_weight,
+    )
+    print(format_report(report))
+    print(f"wrote {path}")
     return 0
 
 
@@ -230,6 +256,7 @@ def cmd_evaluate(args) -> int:
                     test_frac=args.test_frac, seed=args.seed,
                     decay=decay, playoff_weight=pw, garbage_weight=gw,
                     score_garbage=not args.holdout_no_garbage,
+                    split=args.split,
                 )
                 t.insert(1, "decay", decay)
                 t.insert(2, "garbage_wt", gw)
@@ -371,13 +398,27 @@ def main(argv=None) -> int:
     p_tune.add_argument("--lambda", dest="ridge_lambda", default="cv")
     p_tune.add_argument(
         "--seeds", type=int, default=3,
-        help="Number of holdout splits to average (default 3; more = "
-        "slower but less noise-chasing)",
+        help="Number of inner holdout splits to average (default 3; more = "
+        "slower but less noise-chasing). Chrono mode uses this many "
+        "forward-chaining folds",
     )
     p_tune.add_argument("--test-frac", type=float, default=0.2)
     p_tune.add_argument(
         "--passes", type=int, default=1,
-        help="Coordinate-descent passes over the parameter grids",
+        help="Coordinate-descent passes over the parameter grids (2 lets "
+        "the model-family choice react to the re-tuned lambda)",
+    )
+    p_tune.add_argument(
+        "--split", choices=["chrono", "random"], default="chrono",
+        help="Holdout scheme: chrono (default) trains on earlier games and "
+        "tests on later ones — the honest protocol for current ratings; "
+        "random reproduces seeded game shuffles",
+    )
+    p_tune.add_argument(
+        "--outer-frac", type=float, default=0.2,
+        help="Fraction of games held out UNTOUCHED for the final unbiased "
+        "score of the winning config (default 0.2; 0 disables nesting and "
+        "reverts to selection-set reporting, which is optimistic)",
     )
     # tuning on all 30 seasons is slow and mixes eras; recent seasons are
     # the sensible zero-decision default (override with --seasons)
@@ -460,7 +501,47 @@ def main(argv=None) -> int:
     )
     p_eval.add_argument("--test-frac", type=float, default=0.2)
     p_eval.add_argument("--seed", type=int, default=0)
+    p_eval.add_argument(
+        "--split", choices=["random", "chrono"], default="random",
+        help="Holdout scheme: random seeded game shuffle (default), or "
+        "chrono — hold out the latest games, train only on earlier ones "
+        "(--seed is then ignored)",
+    )
     p_eval.set_defaults(func=cmd_evaluate)
+
+    p_cal = sub.add_parser(
+        "calibrate-curvature",
+        help="Null calibration for interaction curvature: simulate additive "
+        "(zero-curvature) copies of the data from the fitted linear model, "
+        "re-run the free-signed interaction fit on each, and report which "
+        "real gammas fall outside the estimator's own null band",
+    )
+    _add_common(p_cal)
+    p_cal.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_cal.add_argument(
+        "--sims", type=int, default=100,
+        help="Null simulations (default 100). Each one re-runs the full "
+        "interaction fit, so expect several seconds per sim on a full "
+        "season",
+    )
+    p_cal.add_argument("--seed", type=int, default=0)
+    p_cal.add_argument(
+        "--alpha", type=float, default=0.05,
+        help="Two-sided size of the null band (default 0.05 -> the central "
+        "95%% of null gammas)",
+    )
+    p_cal.add_argument(
+        "--offense-curvature", choices=["diminishing", "free"], default="free",
+        help="Curvature mode being calibrated (default free — the whole "
+        "point is to test the unconstrained estimator)",
+    )
+    p_cal.add_argument(
+        "--defense-curvature", choices=["diminishing", "free"], default="free",
+    )
+    p_cal.add_argument("--decay", type=float, default=1.0)
+    p_cal.add_argument("--playoff-weight", type=float, default=1.0)
+    p_cal.add_argument("--garbage-weight", type=float, default=1.0)
+    p_cal.set_defaults(func=cmd_calibrate_curvature)
 
     p_smoke = sub.add_parser(
         "smoke-test",
