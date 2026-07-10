@@ -240,6 +240,11 @@ def _apply_weight_multipliers(
 ) -> pd.DataFrame:
     """Attach a weight_mult column and drop zero-weight rows."""
     if decay == 1.0 and playoff_weight == 1.0 and garbage_weight == 1.0:
+        if garbage_rule is not None:
+            logger.warning(
+                "garbage_rule has no effect at garbage_weight=1.0 (the rule "
+                "only decides which rows the weight applies to)"
+            )
         return stints
     mult = np.ones(len(stints))
     if decay != 1.0:

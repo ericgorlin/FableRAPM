@@ -167,7 +167,8 @@ def build_season(
         )
 
     cached = [g for g in todo if _pbp_cached(data_dir, g)] if workers > 1 else []
-    serial = [g for g in todo if g not in set(cached)]
+    cached_set = set(cached)
+    serial = [g for g in todo if g not in cached_set]
 
     if cached:
         logger.info(
