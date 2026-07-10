@@ -89,3 +89,62 @@ def test_garbage_weight_zero_equals_filtering():
     plain_stints = stints.drop(columns=["garbage"])
     with pytest.raises(ValueError, match="garbage"):
         fit_rapm(plain_stints, lam=500.0, garbage_weight=0.5)
+
+
+def with_late_context(stints, seed=0, late_frac=0.25):
+    """Attach margin/secs_left to a random subset of rows (Q4-like)."""
+    rng = np.random.default_rng(seed)
+    late = rng.random(len(stints)) < late_frac
+    stints = stints.copy()
+    stints["margin"] = np.where(
+        late, rng.integers(-35, 36, len(stints)).astype(float), np.nan
+    )
+    stints["secs_left"] = np.where(
+        late, rng.integers(0, 721, len(stints)).astype(float), np.nan
+    )
+    return stints
+
+
+def test_garbage_rule_flags_match_threshold():
+    from fablerapm.model import garbage_flags
+
+    true_off, true_def = make_league()
+    stints = with_late_context(simulate_stints(true_off, true_def, n_games=20))
+    flags = garbage_flags(stints, (12.0, 1.5))
+    margin = stints["margin"].to_numpy()
+    secs = stints["secs_left"].to_numpy()
+    expected = (
+        np.isfinite(margin)
+        & np.isfinite(secs)
+        & (np.abs(margin) >= 12.0 + 1.5 * secs / 60.0)
+    )
+    assert (flags == expected).all()
+    assert flags.any() and not flags.all()
+    # early-game rows (no context) are never garbage under a rule
+    assert not flags[~np.isfinite(margin)].any()
+
+
+def test_garbage_rule_weight_zero_equals_filtering():
+    from fablerapm.model import garbage_flags
+
+    true_off, true_def = make_league()
+    stints = with_late_context(simulate_stints(true_off, true_def, n_games=60))
+    stints["garbage"] = False  # stored flag disagrees with the rule on purpose
+    rule = (10.0, 1.0)
+
+    dropped = fit_rapm(
+        stints, lam=500.0, garbage_weight=0.0, garbage_rule=rule
+    )
+    filtered = fit_rapm(stints[~garbage_flags(stints, rule)], lam=500.0)
+    merged = dropped.players.merge(
+        filtered.players, on="player_id", suffixes=("_d", "_f")
+    )
+    assert np.allclose(merged["rapm_d"], merged["rapm_f"], atol=1e-6)
+    assert dropped.meta["garbage_rule"] == [10.0, 1.0]
+
+    # rule requested but schema lacks the context columns
+    with pytest.raises(ValueError, match="margin"):
+        fit_rapm(
+            stints.drop(columns=["margin", "secs_left"]),
+            lam=500.0, garbage_weight=0.0, garbage_rule=rule,
+        )

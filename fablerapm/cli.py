@@ -56,6 +56,7 @@ def cmd_build(args) -> int:
         game_limit=args.game_limit,
         refresh_schedule=args.refresh_schedule,
         retry_failed=args.retry_failed,
+        workers=args.workers,
     )
     failed_total = 0
     for s in summaries:
@@ -73,6 +74,23 @@ def cmd_build(args) -> int:
     return 0
 
 
+def _parse_garbage_rule(spec: str | None) -> tuple[float, float] | None:
+    if spec is None:
+        return None
+    parts = [p.strip() for p in spec.split(",")]
+    if len(parts) != 2:
+        raise SystemExit(
+            f"--garbage-rule expects 'BASE,PER_MINUTE' (e.g. '12,1.5'), "
+            f"got {spec!r}"
+        )
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        raise SystemExit(
+            f"--garbage-rule expects two numbers 'BASE,PER_MINUTE', got {spec!r}"
+        )
+
+
 def cmd_rapm(args) -> int:
     from .model import run_rapm
 
@@ -85,6 +103,7 @@ def cmd_rapm(args) -> int:
         decay=args.decay,
         playoff_weight=args.playoff_weight,
         garbage_weight=args.garbage_weight,
+        garbage_rule=_parse_garbage_rule(args.garbage_rule),
         interactions=args.interactions,
         offense_curvature=args.offense_curvature,
         defense_curvature=args.defense_curvature,
@@ -93,6 +112,7 @@ def cmd_rapm(args) -> int:
         from .tune import load_tuned_config
 
         cfg = load_tuned_config(data_dir)
+        rule = cfg.get("garbage_rule")
         kwargs = dict(
             lam=cfg["lambda"],
             prior_kind=cfg["prior"],
@@ -100,6 +120,7 @@ def cmd_rapm(args) -> int:
             decay=cfg["decay"],
             playoff_weight=cfg["playoff_weight"],
             garbage_weight=cfg["garbage_weight"],
+            garbage_rule=tuple(rule) if rule else None,
             interactions=cfg["interactions"],
             offense_curvature=cfg["offense_curvature"],
             defense_curvature=cfg["defense_curvature"],
@@ -150,6 +171,7 @@ def cmd_calibrate_curvature(args) -> int:
     report, path = run_calibration(
         data_dir, seasons, season_types,
         lam=lam, n_sims=args.sims, seed=args.seed, alpha=args.alpha,
+        null=args.null,
         offense_curvature=args.offense_curvature,
         defense_curvature=args.defense_curvature,
         decay=args.decay, playoff_weight=args.playoff_weight,
@@ -305,6 +327,12 @@ def main(argv=None) -> int:
         "--retry-failed", action="store_true",
         help="Retry games that failed to parse on previous runs",
     )
+    p_build.add_argument(
+        "--workers", type=int, default=1,
+        help="Parallel workers for games already in the raw cache (pure "
+        "re-parse, e.g. after a schema change or deleting data/stints). "
+        "Uncached games are always fetched serially at ~1 req/s",
+    )
     p_build.set_defaults(func=cmd_build)
 
     p_rapm = sub.add_parser("rapm", help="Fit RAPM from stored stints, write CSVs")
@@ -361,6 +389,14 @@ def main(argv=None) -> int:
         "--garbage-weight", type=float, default=1.0,
         help="Weight multiplier for garbage-time stints: 1.0 keeps (default), "
         "0 drops, in between downweights",
+    )
+    p_rapm.add_argument(
+        "--garbage-rule", default=None, metavar="BASE,PER_MINUTE",
+        help="Fit-time garbage definition replacing the parse-time tiers: "
+        "a Q4/OT possession is garbage when |margin| >= BASE + PER_MINUTE "
+        "x minutes left in the period (e.g. '12,1.5'). Needs stints parsed "
+        "with the margin/secs_left schema; only matters with "
+        "--garbage-weight != 1",
     )
     p_rapm.add_argument(
         "--interactions", action="store_true",
@@ -525,6 +561,13 @@ def main(argv=None) -> int:
         "season",
     )
     p_cal.add_argument("--seed", type=int, default=0)
+    p_cal.add_argument(
+        "--null", choices=["poisson", "resample"], default="poisson",
+        help="Null outcome generator: poisson draws points around the "
+        "linear model's rates (slightly conservative dispersion); resample "
+        "redraws studentized residuals with replacement, matching the real "
+        "data's dispersion exactly",
+    )
     p_cal.add_argument(
         "--alpha", type=float, default=0.05,
         help="Two-sided size of the null band (default 0.05 -> the central "

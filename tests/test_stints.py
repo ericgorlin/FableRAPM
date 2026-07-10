@@ -118,6 +118,42 @@ def test_garbage_possessions_split_into_separate_rows():
     assert by_garbage[True]["poss"] == 1 and by_garbage[True]["points"] == 3
 
 
+def test_margin_and_secs_stored_for_late_game_rows():
+    possessions = [
+        possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 2),  # Q1: no context
+        possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 2,
+                   period=4, start_time="8:30", margin=-7),
+        possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 0,
+                   period=4, start_time="2:10", margin=-9),
+    ]
+    rows = possessions_to_stint_rows(possessions, "TESTM")
+    # same lineups + garbage flag, but distinct Q4 contexts stay separate
+    assert len(rows) == 3
+    by_margin = {r["margin"]: r for r in rows}
+    early = by_margin[None]
+    assert early["secs_left"] is None and early["poss"] == 1
+    assert by_margin[-7]["secs_left"] == 510
+    assert by_margin[-9]["secs_left"] == 130 and by_margin[-9]["points"] == 0
+
+
+def test_late_technical_points_merge_into_matchup_row():
+    # B scores a technical FT during A's Q4 possession; B's own offensive
+    # possession against A happened at a different Q4 moment. The points
+    # must still land on B's offensive row for that matchup (the
+    # pre-margin/secs schema merged them by aggregating on lineups+garbage).
+    b_offense = possession(TEAM_B, LINEUP_B, TEAM_A, LINEUP_A, 2,
+                           period=4, start_time="6:00", margin=3)
+    tech = FakePossession(
+        player_rows("OffPoss", 1, TEAM_A, LINEUP_A, TEAM_B, LINEUP_B)
+        + player_rows("OpponentPoints", 1, TEAM_A, LINEUP_A, TEAM_B, LINEUP_B),
+        period=4, start_time="4:00", margin=5,
+    )
+    rows = possessions_to_stint_rows([b_offense, tech], "TESTT")
+    b_rows = [r for r in rows if r["off_lineup"] == LINEUP_B]
+    assert len(b_rows) == 1  # merged, not an orphan poss=0 row
+    assert b_rows[0]["poss"] == 1 and b_rows[0]["points"] == 3
+
+
 def test_score_reconciliation():
     possessions = [
         possession(TEAM_A, LINEUP_A, TEAM_B, LINEUP_B, 2),

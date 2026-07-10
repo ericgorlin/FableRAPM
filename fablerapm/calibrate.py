@@ -103,22 +103,44 @@ def _curvature_scores(result, stints: pd.DataFrame) -> dict[str, float]:
 
 
 def simulate_null_points(
-    stints: pd.DataFrame, linear_result, rng: np.random.Generator
+    stints: pd.DataFrame,
+    linear_result,
+    rng: np.random.Generator,
+    null: str = "poisson",
 ) -> pd.DataFrame:
     """One synthetic copy of the dataset under the fitted additive model.
 
-    Lineups, games, and possession counts are the real ones; only points are
-    replaced, drawn Poisson with mean = predicted points/100 x poss / 100.
-    Poisson slightly understates real per-possession scoring variance (2s
-    and 3s), which makes the null band conservative in the safe direction:
-    real noise is wider, so a gamma that clears this band clears an
+    Lineups, games, and possession counts are the real ones; only points
+    are replaced. Two generators:
+
+    ``poisson``: points ~ Poisson(predicted points/100 x poss / 100).
+    Slightly understates real per-possession scoring variance (2s and 3s),
+    which makes the null band conservative in the safe direction: real
+    noise is wider, so a gamma that clears this band clears an
     easier-than-life null only in dispersion, not in bias — and bias is
     what this calibration exists to measure.
+
+    ``resample``: redraw studentized residuals with replacement. Each row's
+    residual (y - mu, in per-100 units) is scaled by sqrt(poss) so rows are
+    exchangeable despite different possession counts, pooled, resampled,
+    and scaled back — matching the real data's dispersion exactly at the
+    cost of assuming residuals are exchangeable after studentization.
+    Simulated points are continuous (the fit never needs integers) and
+    clipped at zero.
     """
+    poss = stints["poss"].to_numpy(dtype=float)
     mu_100 = np.clip(predict_stints(linear_result, stints), 1e-6, None)
-    lam = mu_100 * stints["poss"].to_numpy(dtype=float) / 100.0
     sim = stints.copy()
-    sim["points"] = rng.poisson(lam)
+    if null == "poisson":
+        sim["points"] = rng.poisson(mu_100 * poss / 100.0)
+    elif null == "resample":
+        y = 100.0 * stints["points"].to_numpy(dtype=float) / poss
+        studentized = (y - mu_100) * np.sqrt(poss)
+        drawn = rng.choice(studentized, size=len(studentized), replace=True)
+        y_sim = mu_100 + drawn / np.sqrt(poss)
+        sim["points"] = np.clip(y_sim * poss / 100.0, 0.0, None)
+    else:
+        raise ValueError(f"Unknown null generator {null!r}")
     return sim
 
 
@@ -128,6 +150,7 @@ def calibrate_curvature(
     n_sims: int = 100,
     seed: int = 0,
     alpha: float = 0.05,
+    null: str = "poisson",
     offense_curvature: str = "free",
     defense_curvature: str = "free",
     decay: float = 1.0,
@@ -183,7 +206,7 @@ def calibrate_curvature(
     null_draws: dict[str, list[float]] = {k: [] for k in real_gammas}
     null_scores: dict[str, list[float]] = {"off": [], "def": []}
     for i in range(n_sims):
-        sim = simulate_null_points(stints, generator, rng)
+        sim = simulate_null_points(stints, generator, rng, null=null)
         sim_fit = fit_interaction_rapm(
             sim, lam=lam,
             offense_curvature=offense_curvature,
@@ -232,6 +255,7 @@ def calibrate_curvature(
     return {
         "lambda": lam,
         "n_sims": n_sims,
+        "null": null,
         "band_reliable": band_reliable,
         "seed": seed,
         "alpha": alpha,
@@ -260,8 +284,8 @@ def format_report(report: dict) -> str:
         f"{'pctile':>8}{'corrected':>11}  finding?"
     )
     lines = [
-        f"null calibration: {report['n_sims']} sims, lambda={report['lambda']:g}, "
-        f"{report['n_games']} games "
+        f"null calibration: {report['n_sims']} {report.get('null', 'poisson')} "
+        f"sims, lambda={report['lambda']:g}, {report['n_games']} games "
         f"(curvature off={report['offense_curvature']} "
         f"def={report['defense_curvature']})",
         "",

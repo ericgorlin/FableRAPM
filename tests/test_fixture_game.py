@@ -94,7 +94,27 @@ def test_fixture_game_through_real_pbpstats(tmp_path):
     rows, warnings = game_stint_rows(data_dir, GAME_ID)
     assert warnings == []
 
-    by_key = {(r["off_lineup"], r["def_lineup"]): r for r in rows}
+    # 4th-quarter rows carry the possession's start margin and seconds
+    # remaining (one row per distinct late-game context); earlier rows are
+    # None. This game stays within 2 points, so nothing is garbage.
+    late = [r for r in rows if r["margin"] is not None]
+    early = [r for r in rows if r["margin"] is None]
+    assert late and early
+    assert all(0 <= r["secs_left"] <= 720 for r in late)
+    assert all(abs(r["margin"]) <= 2 for r in late)
+    assert all(r["secs_left"] is None for r in early)
+    assert not any(r["garbage"] for r in rows)
+    # Q4 contributes 10 makes + a period-end holding possession
+    assert sum(r["poss"] for r in late) == 11
+    assert sum(r["points"] for r in late) == 20
+
+    # aggregate per lineup matchup (late-game rows split by context)
+    by_key = {}
+    for r in rows:
+        k = (r["off_lineup"], r["def_lineup"])
+        agg = by_key.setdefault(k, {"poss": 0, "points": 0})
+        agg["poss"] += r["poss"]
+        agg["points"] += r["points"]
     h1 = lineup(H)  # 101-105
     h2 = lineup([101, 102, 103, 104, 106])
     v = lineup(V)

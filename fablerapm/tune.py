@@ -23,17 +23,19 @@ is the right protocol when the model's job is current ratings or upcoming
 games. ``random`` reproduces the old seeded game shuffles.
 
 Parameters searched (grids skipped automatically when not applicable):
-    garbage_weight; decay (multi-season data only); playoff_weight (mixed
-    season types only); prior kind + scale (none / two-phase / last-season,
-    last-season only when the previous season is built); interactions
-    on/off and the defense curvature mode; ridge lambda over a multiplier
-    grid around the CV pick, searched *last* so it re-tunes for whichever
-    model family the descent has settled on (use ``--passes 2`` to let the
-    family choice react to the re-tuned lambda in turn).
+    garbage weight x rule (parse-time flag or fit-time linear threshold,
+    the latter only when the stint schema carries margin/secs_left); decay
+    (multi-season data only); playoff_weight (mixed season types only);
+    prior kind + scale (none / two-phase / last-season, last-season only
+    when the previous season is built); interactions on/off and the
+    defense curvature mode; ridge lambda over a multiplier grid around the
+    CV pick, searched *last* so it re-tunes for whichever model family the
+    descent has settled on (use ``--passes 2`` to let the family choice
+    react to the re-tuned lambda in turn).
 
-Not searched, by design: parse-time definitions (garbage-time tiers,
-possession attribution), the interaction feature basis, and the offensive
-sign constraint — see README.
+Not searched, by design: parse-time definitions (possession attribution),
+the interaction feature basis, and the offensive sign constraint — see
+README.
 """
 
 import json
@@ -50,6 +52,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     "lambda": None,
     "garbage_weight": 1.0,
+    "garbage_rule": None,
     "decay": 1.0,
     "playoff_weight": 1.0,
     "prior": "none",
@@ -61,6 +64,11 @@ DEFAULT_CONFIG = {
 
 LAMBDA_MULTIPLIERS = [0.25, 0.5, 1.0, 2.0, 4.0]
 
+# fit-time garbage thresholds |margin| >= base + per_minute * minutes_left,
+# searched only when the stint schema carries margin/secs_left (see
+# model.garbage_flags); None = the parse-time GARBAGE_TIERS flag
+GARBAGE_RULES = [[8.0, 1.0], [12.0, 1.5], [16.0, 2.0]]
+
 
 def tuned_config_path(data_dir: Path) -> Path:
     return data_dir / "results" / "tuned_config.json"
@@ -70,11 +78,13 @@ def _fit(train, cfg, data_dir, seasons, season_types):
     from .prior import last_season_prior, two_phase_prior
 
     lam = cfg["lambda"]
+    rule = cfg.get("garbage_rule")
     kw = dict(
         lam=lam,
         decay=cfg["decay"],
         playoff_weight=cfg["playoff_weight"],
         garbage_weight=cfg["garbage_weight"],
+        garbage_rule=tuple(rule) if rule else None,
     )
     prior = None
     if cfg["prior"] == "two-phase":
@@ -109,7 +119,20 @@ def _candidate_grids(stints, data_dir, seasons, season_types, base_lambda) -> li
     """(param updates applied together) grouped per coordinate."""
     grids = []
     if "garbage" in stints:
-        grids.append(("garbage_weight", [{"garbage_weight": v} for v in (1.0, 0.5, 0.0)]))
+        garbage_options = [
+            {"garbage_weight": v, "garbage_rule": None} for v in (1.0, 0.5, 0.0)
+        ]
+        # fit-time thresholds only matter at weight != 1, and only when the
+        # schema carries the late-game context
+        if {"margin", "secs_left"} <= set(stints.columns) and (
+            stints["secs_left"].notna().any()
+        ):
+            garbage_options += [
+                {"garbage_weight": w, "garbage_rule": rule}
+                for w in (0.5, 0.0)
+                for rule in GARBAGE_RULES
+            ]
+        grids.append(("garbage", garbage_options))
     if "season" in stints and stints["season"].nunique() > 1:
         grids.append(("decay", [{"decay": v} for v in (1.0, 0.95, 0.9, 0.8)]))
     if "season_type" in stints and stints["season_type"].nunique() > 1:
@@ -268,4 +291,5 @@ def load_tuned_config(data_dir: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"No tuned config at {path}; run `fablerapm tune` first")
     cfg = json.loads(path.read_text())
-    return {k: cfg[k] for k in DEFAULT_CONFIG}
+    # .get: configs written before a key existed fall back to its default
+    return {k: cfg.get(k, default) for k, default in DEFAULT_CONFIG.items()}

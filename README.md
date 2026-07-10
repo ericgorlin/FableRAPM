@@ -92,6 +92,9 @@ and any accounting notes.
   points per season, at most).
 - All possessions are stored; garbage time is *flagged*, and filtering or
   downweighting is a fit-time choice (`--garbage-weight`), not a data choice.
+  Late-game (Q4/OT) stint rows also store the possession's start margin and
+  seconds remaining, so even the garbage *definition* is a fit-time choice
+  (`--garbage-rule`, searched by `tune`).
 - SPM **features** are official full-season aggregates from stats.nba.com,
   so they always include garbage time and can't be decayed per possession;
   the weighting knobs apply to the stint regressions (including the SPM's
@@ -158,11 +161,18 @@ Weighting knobs (all recorded in the output meta):
   when types are pooled with `--combine-types` (no effect on single-type
   fits, where it would only distort the effective lambda).
 - `--garbage-weight`: 1.0 keeps garbage time (default), 0 drops it, between
-  downweights. Garbage time = Q4/OT possession starting with margin >= 25
-  (any time), 18 (last 6 min), or 12 (last 3 min) — flagged per stint at
-  parse time (`stints.GARBAGE_TIERS`), so changing the *rule* requires a
-  re-parse (delete `data/stints/`, re-run `build`; offline from the raw
-  cache), while changing the *weight* is instant.
+  downweights. The default garbage definition is the parse-time flag:
+  Q4/OT possession starting with margin >= 25 (any time), 18 (last 6 min),
+  or 12 (last 3 min) (`stints.GARBAGE_TIERS`).
+- `--garbage-rule BASE,PER_MINUTE`: replace the parse-time flag with a
+  fit-time definition — a Q4/OT possession is garbage when `|margin| >=
+  BASE + PER_MINUTE x minutes left in the period`. Works because every
+  late-game stint row stores the possession's start margin and seconds
+  remaining (`margin`/`secs_left` columns), so the garbage *rule* is now a
+  tunable parameter (tune searches a small grid of them), not a data
+  definition. Stints parsed before this schema lack the columns: delete
+  `data/stints/`, re-run `build` (offline from the raw cache; use
+  `--workers N` to parallelize the re-parse).
 
 ```bash
 # 1. scrape features (8 requests/season: 2 box + 6 tracking)
@@ -240,7 +250,7 @@ present, hours, resumable) followed by `validate` and
 ## Suggested experiments (in order)
 
 ```bash
-pip install -e ".[dev]" && pytest        # 51 offline tests, no network
+pip install -e ".[dev]" && pytest        # 57 offline tests, no network
 fablerapm smoke-test                     # ~8 live API requests, end-to-end
 ```
 
@@ -357,9 +367,11 @@ holdout gaps between reasonable settings are small, so prefer more
 `--seeds` over more `--passes`; and parameters whose grid doesn't apply
 (decay on one season, playoff weight on one type, last-season prior
 without the previous season built) are skipped automatically. What tune
-does NOT search: parse-time definitions (garbage tiers, possession
-attribution), the interaction feature basis, and the offensive sign
-constraint — those are structural (see TODO below).
+does NOT search: possession attribution (parse-time), the interaction
+feature basis, and the offensive sign constraint — those are structural
+(see TODO below). The garbage-time *rule* IS searched (a grid of fit-time
+`BASE + PER_MINUTE x minutes-left` thresholds alongside the parse-time
+tiers) whenever the stint schema carries the late-game context columns.
 
 **6. Full history**, once happy with settings:
 
@@ -374,47 +386,44 @@ fablerapm rapm                     # per-season, both season types
 The goal state is that *no* configuration is a human decision. What still
 stands between here and there:
 
-1. **Learn the garbage-time rule from data**: the margin/time tiers are
-   parse-time constants baked into a boolean. Store the possession's
-   start margin and seconds remaining on each stint row instead, and let
-   `tune` learn a smooth downweighting function of (margin, time) — turns
-   a data definition into a fit-time parameter. Requires a schema change +
-   re-parse (offline, from the raw cache).
-2. **Golden games for lineup attribution**: score reconciliation proves
+1. **Golden games for lineup attribution**: score reconciliation proves
    totals, not attribution (see the validate section). Hand-verify a small
    set of games covering the nasty edge cases — simultaneous substitutions,
    technical/flagrant free throws, substitutions between free throws,
    offensive rebounds and possession continuation, end-of-quarter events,
-   overturned calls — and pin their exact stint rows as fixtures.
-3. **Own box-score/tracking aggregation from play-by-play**: SPM features
+   overturned calls — and pin their exact stint rows as fixtures
+   (`tests/test_fixture_game.py` shows the harness: fabricate or cache the
+   raw pbp, assert exact rows through the real pbpstats path).
+2. **Own box-score/tracking aggregation from play-by-play**: SPM features
    currently come from official full-season aggregates, so they include
    garbage time and can't be decayed or filtered consistently with the
    stint weights. pbpstats emits per-event stats with the same lineup
    attribution we already use; aggregating them ourselves makes features
    consistent with every weighting knob and extends "tracking-adjacent"
    features to all seasons.
-4. **Richer interaction basis**: splines/kernels over lineup talent
+3. **Richer interaction basis**: splines/kernels over lineup talent
    composition instead of three hand-picked convex shapes; the basis is a
    one-line list (`model.INTERACTION_FEATURES`), and tune/evaluate already
    referee additions. Position/role-aware concentration (creator vs big)
    once SPM features exist per player.
-5. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
+4. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
    / opponent FT% with expected values at parse time (schema addition),
    then let tune decide if it helps.
-6. **Parallel re-parse** (`build --workers N`): pure-Python possession
-   parsing dominates cache re-parses of 40k games.
-7. **Aging curve in the last-season prior**: scale by a learned age curve
+5. **Aging curve in the last-season prior**: scale by a learned age curve
    rather than one global `prior_scale`.
-8. **Residual-resampling null option**: `calibrate-curvature` simulates
-   Poisson stint outcomes, which slightly understate real per-possession
-   scoring variance (2s and 3s); a resampled-residual generator would match
-   dispersion exactly. (Conservative in the safe direction as-is.)
+6. **Smooth garbage downweighting**: the fit-time garbage rule is a hard
+   threshold family; with margin/secs_left stored per row, a continuous
+   weight surface (e.g. logistic in margin with a time-varying midpoint)
+   is one function away, and tune can referee it against the thresholds.
 
 Done and moved out of this list: null calibration for curvature signs
-(`fablerapm calibrate-curvature`, see experiment 5) and nested +
-chronological holdout evaluation for `tune` (outer untouched test block,
-forward-chaining inner splits, lambda in the search grid — see experiment
-5b).
+(`fablerapm calibrate-curvature`, experiment 5) with Poisson or
+residual-resampling nulls (`--null resample`); nested + chronological
+holdout evaluation for `tune` (outer untouched test block,
+forward-chaining inner splits, lambda in the search grid — experiment 5b);
+the garbage-time rule as a fit-time, tune-searched parameter
+(`--garbage-rule`, margin/secs stored per late-game stint row); and
+parallel cache re-parses (`build --workers N`).
 
 ## Data layout
 

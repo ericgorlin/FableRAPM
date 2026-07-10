@@ -46,6 +46,34 @@ def test_build_processes_and_resumes(tmp_path, monkeypatch):
     assert len(df2) == len(df)
 
 
+def test_build_parallel_workers_match_serial(tmp_path, monkeypatch):
+    # three cached copies of the fixture game under different ids, one
+    # broken game: parallel re-parse must produce exactly the serial result
+    ids = ["0022300901", "0022300902", "0022300903"]
+    bad_id = "0022300904"
+    data_dir = seed(tmp_path, monkeypatch, ids + [bad_id])
+    raw = data_dir / "raw"
+    fixture = json.dumps(make_fixture_pbp())
+    for gid in ids:
+        (raw / "pbp" / f"stats_{gid}.json").write_text(
+            fixture.replace(GAME_ID, gid)
+        )
+    (raw / "pbp" / f"stats_{bad_id}.json").write_text("{}")
+
+    summary = build_season(data_dir, SEASON, STYPE, workers=2)
+    assert summary["processed"] == 3 and summary["failed"] == 1
+
+    df = pd.read_parquet(stints_path(data_dir, SEASON, STYPE))
+    assert set(df["game_id"]) == set(ids)
+    per_game = df.groupby("game_id")[["poss", "points"]].sum()
+    assert (per_game["poss"] == 44).all() and (per_game["points"] == 80).all()
+
+    manifest = json.loads(manifest_path(data_dir, SEASON, STYPE).read_text())
+    assert bad_id in manifest["failed"]
+    # a parallel re-run over the same manifest is a no-op
+    assert build_season(data_dir, SEASON, STYPE, workers=2)["new"] == 0
+
+
 def test_build_records_failures(tmp_path, monkeypatch):
     bad_id = "0022309998"
     data_dir = seed(tmp_path, monkeypatch, [GAME_ID, bad_id])

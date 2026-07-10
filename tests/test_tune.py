@@ -16,6 +16,13 @@ def seed_two_seasons(data_dir):
         df = simulate_stints(true_off, true_def, n_games=25, seed=seed)
         df["game_id"] = f"S{seed}_" + df["game_id"]
         df["garbage"] = rng.random(len(df)) < 0.08
+        late = rng.random(len(df)) < 0.25
+        df["margin"] = np.where(
+            late, rng.integers(-35, 36, len(df)).astype(float), np.nan
+        )
+        df["secs_left"] = np.where(
+            late, rng.integers(0, 721, len(df)).astype(float), np.nan
+        )
         path = stints_path(data_dir, season, "Regular Season")
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=False)
@@ -33,9 +40,13 @@ def test_tune_writes_config_and_rapm_uses_it(tmp_path):
     # searched coordinates present, incl. last-season prior (2023-24 exists)
     # and the lambda multiplier grid
     notes = {h["note"] for h in result["history"]}
-    assert {"baseline", "garbage_weight", "prior", "interactions", "lambda"} <= notes
+    assert {"baseline", "garbage", "prior", "interactions", "lambda"} <= notes
     assert any(
         h["config"]["prior"] == "last-season" for h in result["history"]
+    )
+    # fit-time garbage rules were searched (schema carries margin/secs_left)
+    assert any(
+        h["config"].get("garbage_rule") for h in result["history"]
     )
     assert np.isfinite(result["inner_mse"])
     assert result["holdout_mse"] == result["inner_mse"]  # legacy alias

@@ -10,6 +10,7 @@ so a nightly ``fablerapm build`` keeps the dataset up to date during a season.
 
 import json
 import logging
+import multiprocessing
 import time
 from pathlib import Path
 
@@ -17,11 +18,26 @@ import pandas as pd
 
 from .config import manifest_path, stints_path
 from .seasons import season_game_ids
-from .stints import STINT_COLUMNS, game_stint_rows
+from .stints import STINT_COLUMNS, _pbp_cached, game_stint_rows
 
 logger = logging.getLogger(__name__)
 
 FLUSH_EVERY = 25
+
+
+def _parse_game_worker(args: tuple) -> tuple:
+    """Parse one cached game in a worker process.
+
+    Returns (game_id, rows, warnings, error): rows is None when parsing
+    failed and error carries the message. Exceptions never propagate — a
+    raised exception would poison the pool and lose the other results.
+    """
+    data_dir, game_id = args
+    try:
+        rows, warnings = game_stint_rows(Path(data_dir), game_id)
+        return game_id, rows, warnings, None
+    except Exception as exc:  # noqa: BLE001 - recorded in the manifest
+        return game_id, None, [], f"{type(exc).__name__}: {exc}"
 
 
 def _load_manifest(path: Path) -> dict:
@@ -47,6 +63,16 @@ def _load_stints(path: Path, manifest: dict) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=STINT_COLUMNS)
     stints = pd.read_parquet(path)
+    missing_cols = [c for c in STINT_COLUMNS if c not in stints.columns]
+    if missing_cols:
+        logger.warning(
+            "%s was written by an older schema (missing %s); new games get "
+            "the new columns but old rows stay NaN. Delete data/stints and "
+            "re-run build (offline re-parse from the raw cache) for a "
+            "uniform dataset — required before using fit-time garbage "
+            "rules on these seasons.",
+            path.name, ", ".join(missing_cols),
+        )
     known = stints["game_id"].isin(manifest["processed"])
     if not known.all():
         logger.warning(
@@ -65,11 +91,20 @@ def build_season(
     game_limit: int | None = None,
     refresh_schedule: bool = False,
     retry_failed: bool = False,
+    workers: int = 1,
 ) -> dict:
     """Scrape/parse all missing games for one season & season type.
 
     Returns a summary dict. ``game_limit`` caps how many games end up in the
     dataset (used by the smoke test to keep API usage tiny).
+
+    ``workers > 1`` parallelizes games whose play-by-play is already in the
+    raw cache (pure-Python re-parsing dominates there — the whole point of
+    a cache rebuild); uncached games always go through the serial throttled
+    path, since the API rate limit is global, not per-process. Caveat: a
+    small share of cached games fall back to a live boxscore request to
+    resolve period starters, so up to ``workers`` requests can occasionally
+    fire concurrently.
     """
     spath = stints_path(data_dir, season, season_type)
     mpath = manifest_path(data_dir, season, season_type)
@@ -109,16 +144,11 @@ def build_season(
             tmp.replace(spath)
         _save_manifest(mpath, manifest)
 
-    for i, game_id in enumerate(todo, 1):
-        try:
-            rows, warnings = game_stint_rows(data_dir, game_id)
-        except KeyboardInterrupt:
-            flush()
-            raise
-        except Exception as exc:
-            logger.warning("%s: failed (%s: %s)", game_id, type(exc).__name__, exc)
-            manifest["failed"][game_id] = f"{type(exc).__name__}: {exc}"
-            continue
+    def record(game_id, rows, warnings, error):
+        if error is not None:
+            logger.warning("%s: failed (%s)", game_id, error)
+            manifest["failed"][game_id] = error
+            return
         for warning in warnings:
             logger.warning("%s: %s", game_id, warning)
         manifest["processed"][game_id] = {
@@ -128,13 +158,52 @@ def build_season(
             "warnings": warnings,
         }
         new_rows.extend(rows)
+
+    def progress(i, total, label):
+        rate = i / (time.monotonic() - started)
+        logger.info(
+            "%s %s: %d/%d %s games (%.0f games/min)",
+            season, season_type, i, total, label, rate * 60,
+        )
+
+    cached = [g for g in todo if _pbp_cached(data_dir, g)] if workers > 1 else []
+    serial = [g for g in todo if g not in set(cached)]
+
+    if cached:
+        logger.info(
+            "%s %s: re-parsing %d cached games with %d workers "
+            "(%d uncached games follow serially)",
+            season, season_type, len(cached), workers, len(serial),
+        )
+        with multiprocessing.Pool(workers) as pool:
+            results = pool.imap_unordered(
+                _parse_game_worker, [(str(data_dir), g) for g in cached]
+            )
+            try:
+                for i, (game_id, rows, warnings, error) in enumerate(results, 1):
+                    record(game_id, rows, warnings, error)
+                    if i % FLUSH_EVERY == 0:
+                        flush()
+                        progress(i, len(cached), "cached")
+            except KeyboardInterrupt:
+                pool.terminate()
+                flush()
+                raise
+        flush()
+
+    for i, game_id in enumerate(serial, 1):
+        try:
+            rows, warnings = game_stint_rows(data_dir, game_id)
+        except KeyboardInterrupt:
+            flush()
+            raise
+        except Exception as exc:
+            record(game_id, None, [], f"{type(exc).__name__}: {exc}")
+            continue
+        record(game_id, rows, warnings, None)
         if i % FLUSH_EVERY == 0:
             flush()
-            rate = i / (time.monotonic() - started)
-            logger.info(
-                "%s %s: %d/%d games (%.0f games/min)",
-                season, season_type, i, len(todo), rate * 60,
-            )
+            progress(i, len(serial), "serial")
     flush()
 
     return {
@@ -155,6 +224,7 @@ def build_many(
     game_limit: int | None = None,
     refresh_schedule: bool = False,
     retry_failed: bool = False,
+    workers: int = 1,
 ) -> list[dict]:
     summaries = []
     for season in seasons:
@@ -165,6 +235,7 @@ def build_many(
                     game_limit=game_limit,
                     refresh_schedule=refresh_schedule,
                     retry_failed=retry_failed,
+                    workers=workers,
                 )
             )
     return summaries

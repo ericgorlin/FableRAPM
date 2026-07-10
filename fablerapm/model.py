@@ -197,11 +197,46 @@ def build_design(
     )
 
 
+def garbage_flags(stints: pd.DataFrame, rule: tuple[float, float] | None) -> np.ndarray:
+    """Boolean garbage-time flag per stint row.
+
+    ``rule=None`` uses the flag stored at parse time (stints.GARBAGE_TIERS).
+    ``rule=(base, per_minute)`` computes it at fit time from the stored
+    late-game context: a 4th-quarter/OT possession is garbage when
+    ``|margin| >= base + per_minute * minutes_remaining_in_period``. The
+    linear-in-time threshold family nests "big lead late, bigger lead
+    early" rules like the parse-time tiers, but is tunable without a
+    re-parse (rows parsed before the margin/secs schema can't use it —
+    re-parse offline from the raw cache).
+    """
+    if rule is None:
+        if "garbage" not in stints:
+            raise ValueError(
+                "garbage_weight requires a 'garbage' column: re-parse "
+                "stints (delete data/stints, re-run `fablerapm build` — "
+                "the raw cache makes this offline and fast)"
+            )
+        return stints["garbage"].to_numpy(dtype=bool)
+    if "margin" not in stints or "secs_left" not in stints:
+        raise ValueError(
+            "garbage_rule requires 'margin' and 'secs_left' columns: "
+            "re-parse stints (delete data/stints, re-run `fablerapm "
+            "build` — the raw cache makes this offline and fast)"
+        )
+    base, per_minute = rule
+    margin = pd.to_numeric(stints["margin"], errors="coerce").to_numpy(dtype=float)
+    secs = pd.to_numeric(stints["secs_left"], errors="coerce").to_numpy(dtype=float)
+    late = np.isfinite(margin) & np.isfinite(secs)
+    threshold = float(base) + float(per_minute) * secs / 60.0
+    return late & (np.abs(margin) >= threshold)
+
+
 def _apply_weight_multipliers(
     stints: pd.DataFrame,
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
     """Attach a weight_mult column and drop zero-weight rows."""
     if decay == 1.0 and playoff_weight == 1.0 and garbage_weight == 1.0:
@@ -226,14 +261,8 @@ def _apply_weight_multipliers(
                 float(playoff_weight),
             )
     if garbage_weight != 1.0:
-        if "garbage" not in stints:
-            raise ValueError(
-                "garbage_weight requires a 'garbage' column: re-parse "
-                "stints (delete data/stints, re-run `fablerapm build` — "
-                "the raw cache makes this offline and fast)"
-            )
         mult *= np.where(
-            stints["garbage"].to_numpy(dtype=bool), float(garbage_weight), 1.0
+            garbage_flags(stints, garbage_rule), float(garbage_weight), 1.0
         )
     stints = stints.assign(weight_mult=mult)
     keep = stints["weight_mult"] > 0
@@ -306,6 +335,7 @@ def fit_rapm(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
 ) -> RapmResult:
     """Fit RAPM on stint rows.
 
@@ -323,9 +353,13 @@ def fit_rapm(
 
     ``garbage_weight`` multiplies the weight of garbage-time stints
     (see stints.GARBAGE_TIERS): 1.0 keeps them, 0.0 drops them entirely,
-    values in between downweight.
+    values in between downweight. ``garbage_rule=(base, per_minute)``
+    replaces the parse-time flag with a fit-time threshold — see
+    ``garbage_flags``.
     """
-    stints = _apply_weight_multipliers(stints, decay, playoff_weight, garbage_weight)
+    stints = _apply_weight_multipliers(
+        stints, decay, playoff_weight, garbage_weight, garbage_rule
+    )
     design = build_design(stints)
     n_players = len(design.player_ids)
 
@@ -377,6 +411,7 @@ def fit_rapm(
         "decay": decay,
         "playoff_weight": playoff_weight,
         "garbage_weight": garbage_weight,
+        "garbage_rule": list(garbage_rule) if garbage_rule else None,
     }
     return RapmResult(players=players, meta=meta)
 
@@ -388,6 +423,7 @@ def fit_interaction_rapm(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
     offense_curvature: str = "diminishing",
     defense_curvature: str = "diminishing",
 ) -> RapmResult:
@@ -435,7 +471,9 @@ def fit_interaction_rapm(
       gracefully to the linear two-phase fit — the correction can give
       stars back their stacking penalty, never take credit from them.
     """
-    stints = _apply_weight_multipliers(stints, decay, playoff_weight, garbage_weight)
+    stints = _apply_weight_multipliers(
+        stints, decay, playoff_weight, garbage_weight, garbage_rule
+    )
     phase1 = fit_rapm(stints, lam=lam)
     lam2 = phase1.meta["lambda"]
     phase1_prior = {
@@ -574,6 +612,7 @@ def run_rapm(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
     interactions: bool = False,
     offense_curvature: str = "diminishing",
     defense_curvature: str = "diminishing",
@@ -623,6 +662,7 @@ def run_rapm(
             fit_kwargs = dict(
                 lam=lam, prior=prior, decay=decay,
                 playoff_weight=playoff_weight, garbage_weight=garbage_weight,
+                garbage_rule=garbage_rule,
             )
             if interactions:
                 result = fit_interaction_rapm(

@@ -38,6 +38,8 @@ STINT_COLUMNS = [
     "off_lineup",
     "def_lineup",
     "garbage",
+    "margin",
+    "secs_left",
     "poss",
     "points",
 ]
@@ -46,6 +48,16 @@ STINT_COLUMNS = [
 # margin at the start of the possession meets the threshold for how much
 # time remains in the period: (seconds_remaining <=, |margin| >=). The flag
 # is stored per stint row so the model can keep/drop/downweight it later.
+#
+# The raw ingredients are stored too: for 4th-quarter/OT possessions,
+# ``margin`` is the score margin at possession start (signed, as pbpstats
+# reports it — the garbage logic only uses its magnitude) and ``secs_left``
+# the seconds remaining in the period; both are NaN for earlier periods.
+# That turns the garbage-time *rule* into a fit-time choice (`fablerapm
+# rapm --garbage-rule` / tune's garbage coordinate) instead of a parse-time
+# constant. Late-game rows therefore aggregate per (lineups, margin, secs)
+# — roughly one row per 4th-quarter possession — which is why row counts
+# are higher than under the old schema.
 GARBAGE_TIERS = [(720, 25), (360, 18), (180, 12)]
 
 
@@ -109,6 +121,13 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
     point_sums: dict[tuple, int] = {}
     for possession in possessions:
         garbage = is_garbage_time(possession)
+        if possession.period >= 4:
+            late = (
+                int(possession.start_score_margin),
+                int(_clock_seconds(possession.start_time)),
+            )
+        else:
+            late = (None, None)
         for stat in possession.possession_stats:
             key_off = None
             if stat["stat_key"] == OFFENSIVE_POSSESSION_STRING:
@@ -119,6 +138,7 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                     stat["opponent_team_id"],
                     stat["opponent_lineup_id"],
                     garbage,
+                    late,
                 )
                 poss_sums[key_off] = poss_sums.get(key_off, 0) + stat["stat_value"]
             elif stat["stat_key"] == OPPONENT_POINTS:
@@ -129,12 +149,28 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                     stat["team_id"],
                     stat["lineup_id"],
                     garbage,
+                    late,
                 )
                 point_sums[key_off] = point_sums.get(key_off, 0) + stat["stat_value"]
 
+    # Technical FTs scored by the defending team are recorded against the
+    # reversed orientation, whose matching offensive possession is a
+    # different possession (with different late-game context). Merge such
+    # point-only keys into an existing possession key for the same lineup
+    # matchup + garbage flag — the pre-margin/secs schema did this
+    # implicitly by aggregating on exactly those fields — preferring the
+    # key with the most possessions. Truly unmatched points stay as
+    # poss=0 rows, dropped and counted at fit time.
+    for key in [k for k in point_sums if k not in poss_sums]:
+        matches = [k for k in poss_sums if k[:5] == key[:5]]
+        if matches:
+            target = max(matches, key=poss_sums.__getitem__)
+            point_sums[target] = point_sums.get(target, 0) + point_sums.pop(key)
+
     rows = []
     for key in poss_sums.keys() | point_sums.keys():
-        off_team_id, off_lineup, def_team_id, def_lineup, garbage = key
+        off_team_id, off_lineup, def_team_id, def_lineup, garbage, late = key
+        margin, secs_left = late
         poss_x5 = poss_sums.get(key, 0)
         points_x5 = point_sums.get(key, 0)
         if poss_x5 % 5 != 0 or points_x5 % 5 != 0:
@@ -155,6 +191,8 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
                 "off_lineup": off_lineup,
                 "def_lineup": def_lineup,
                 "garbage": garbage,
+                "margin": margin,
+                "secs_left": secs_left,
                 "poss": poss_x5 // 5,
                 "points": points_x5 // 5,
             }

@@ -19,6 +19,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from fablerapm.calibrate import calibrate_curvature, format_report
 from fablerapm.cli import main
@@ -99,6 +100,41 @@ def test_concave_world_is_flagged():
         or report["sides"]["def"]["outside_null"]
     )
     assert "OUTSIDE NULL" in format_report(report)
+
+
+def test_resample_null_matches_real_dispersion():
+    import pandas as pd
+
+    from fablerapm.calibrate import simulate_null_points
+    from fablerapm.model import fit_rapm
+
+    true_off, true_def = make_league()
+    stints = simulate_stints(true_off, true_def, n_games=80, seed=12)
+    result = fit_rapm(stints, lam=1000.0)
+    rng = np.random.default_rng(0)
+
+    sims = {
+        kind: simulate_null_points(stints, result, rng, null=kind)
+        for kind in ("poisson", "resample")
+    }
+    for kind, sim in sims.items():
+        assert (sim["points"] >= 0).all()
+        assert len(sim) == len(stints)
+        # totals in the right ballpark (means match the fitted rates)
+        assert 0.8 < sim["points"].sum() / stints["points"].sum() < 1.2
+    # resampling redraws real residuals, so the studentized spread should
+    # track the real data's more closely than a pure Poisson draw must
+    poss = stints["poss"].to_numpy(dtype=float)
+
+    def spread(points):
+        y = 100.0 * np.asarray(points, dtype=float) / poss
+        return np.std(y * np.sqrt(poss))
+
+    real = spread(stints["points"])
+    assert abs(spread(sims["resample"]["points"]) - real) < 0.25 * real
+
+    with pytest.raises(ValueError, match="null"):
+        simulate_null_points(stints, result, rng, null="bogus")
 
 
 def test_cli_calibrate_curvature_writes_report(tmp_path):
