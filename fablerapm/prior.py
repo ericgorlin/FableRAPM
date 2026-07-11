@@ -232,20 +232,34 @@ def learn_age_curve(
     per season), and regress season-t values on season-(t-1) values through
     the origin — O and D components stacked, weighted by the smaller
     season's possessions — within age buckets (age = target-season age).
+
+    Seasons without built stint data are skipped (so the default
+    ``--seasons all`` learns from every consecutive pair you have built).
     """
-    from .config import season_end_year
+    from .config import season_end_year, stints_path
     from .model import fit_rapm, load_stints
 
     ordered = sorted(seasons, key=season_end_year)
+    built = [
+        s for s in ordered
+        if all(stints_path(data_dir, s, t).exists() for t in season_types)
+    ]
+    if skipped := [s for s in ordered if s not in built]:
+        logger.info(
+            "age curve: skipping %d season(s) without built stints (%s%s)",
+            len(skipped), ", ".join(skipped[:4]),
+            ", ..." if len(skipped) > 4 else "",
+        )
     pairs = [
-        (a, b) for a, b in zip(ordered, ordered[1:])
+        (a, b) for a, b in zip(built, built[1:])
         if season_end_year(b) == season_end_year(a) + 1
     ]
     if not pairs:
         raise ValueError(
-            f"Need at least two consecutive seasons to learn an age curve, "
-            f"got {seasons}"
+            "Need at least two consecutive seasons with built stint data "
+            f"to learn an age curve; built seasons in scope: {built or 'none'}"
         )
+    ordered = built
 
     obs: list[tuple[str, float, float, float]] = []  # bucket, x, y, w
     fits: dict[str, pd.DataFrame] = {}
