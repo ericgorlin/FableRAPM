@@ -44,8 +44,19 @@ from pathlib import Path
 
 import numpy as np
 
-from .evaluate import _weighted_mse, chrono_split, holdout_split, predict_stints
-from .model import cross_validate_lambda, build_design, fit_interaction_rapm, fit_rapm
+from .evaluate import (
+    _weighted_mse,
+    intercept_baseline,
+    predict_stints,
+    split_games,
+)
+from .model import (
+    build_design,
+    cross_validate_lambda,
+    fit_interaction_rapm,
+    fit_rapm,
+    late_context_complete,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,16 +133,22 @@ def _candidate_grids(stints, data_dir, seasons, season_types, base_lambda) -> li
         garbage_options = [
             {"garbage_weight": v, "garbage_rule": None} for v in (1.0, 0.5, 0.0)
         ]
-        # fit-time thresholds only matter at weight != 1, and only when the
-        # schema carries the late-game context
-        if {"margin", "secs_left"} <= set(stints.columns) and (
-            stints["secs_left"].notna().any()
-        ):
+        # fit-time thresholds only matter at weight != 1, and only when
+        # EVERY garbage-flagged row carries the late-game context — on
+        # mixed old/new-schema data a rule would silently no-op on the old
+        # seasons, making rule-vs-flag candidates incomparable
+        if late_context_complete(stints):
             garbage_options += [
                 {"garbage_weight": w, "garbage_rule": rule}
                 for w in (0.5, 0.0)
                 for rule in GARBAGE_RULES
             ]
+        else:
+            logger.info(
+                "fit-time garbage rules not searched: stint rows lack "
+                "complete margin/secs_left coverage (re-parse old seasons "
+                "to enable)"
+            )
         grids.append(("garbage", garbage_options))
     if "season" in stints and stints["season"].nunique() > 1:
         grids.append(("decay", [{"decay": v} for v in (1.0, 0.95, 0.9, 0.8)]))
@@ -172,17 +189,9 @@ def _candidate_grids(stints, data_dir, seasons, season_types, base_lambda) -> li
 
 
 def _make_splits(dev, split: str, n_seeds: int, test_frac: float) -> list[tuple]:
-    if split == "chrono":
-        raw = [
-            chrono_split(dev, test_frac=test_frac, fold=i, n_folds=n_seeds)
-            for i in range(n_seeds)
-        ]
-    else:
-        raw = [holdout_split(dev, test_frac, seed) for seed in range(n_seeds)]
-    # zero-possession rows (orphaned technical FTs) can't be scored
     return [
-        (train, test[test["poss"] > 0].reset_index(drop=True))
-        for train, test in raw
+        split_games(dev, split, test_frac, seed=i, fold=i, n_folds=n_seeds)
+        for i in range(n_seeds)
     ]
 
 
@@ -203,11 +212,7 @@ def tune(
 
     # outer split first: the search never sees these games
     if outer_frac > 0:
-        if split == "chrono":
-            dev, outer_test = chrono_split(stints, test_frac=outer_frac)
-        else:
-            dev, outer_test = holdout_split(stints, outer_frac, seed=10_000)
-        outer_test = outer_test[outer_test["poss"] > 0].reset_index(drop=True)
+        dev, outer_test = split_games(stints, split, outer_frac, seed=10_000)
         logger.info(
             "outer test: %d games held out untouched (%s split); "
             "tuning on the remaining %d",
@@ -222,8 +227,19 @@ def tune(
     base_lambda = float(lam)
     splits = _make_splits(dev, split, n_seeds, test_frac)
 
+    # memoized by config so multi-pass runs don't re-fit identical candidates
+    score_cache: dict[str, float] = {}
+
+    def score(candidate: dict) -> float:
+        key = json.dumps(candidate, sort_keys=True)
+        if key not in score_cache:
+            score_cache[key] = _score(
+                candidate, splits, data_dir, seasons, season_types
+            )
+        return score_cache[key]
+
     history = []
-    best = _score(cfg, splits, data_dir, seasons, season_types)
+    best = score(cfg)
     history.append({"config": dict(cfg), "mse": best, "note": "baseline"})
     logger.info("baseline inner MSE %.4f (lambda=%g)", best, lam)
 
@@ -237,7 +253,7 @@ def tune(
                 if candidate == cfg:
                     continue
                 try:
-                    mse = _score(candidate, splits, data_dir, seasons, season_types)
+                    mse = score(candidate)
                 except Exception as exc:
                     logger.warning("%s candidate %s failed: %s", name, update, exc)
                     continue
@@ -246,9 +262,19 @@ def tune(
                 if mse < best:
                     best, cfg = mse, candidate
 
+    if cfg["lambda"] in (
+        base_lambda * LAMBDA_MULTIPLIERS[0], base_lambda * LAMBDA_MULTIPLIERS[-1]
+    ):
+        logger.warning(
+            "tuned lambda %g sits at the edge of the searched grid "
+            "(%gx-%gx of the CV pick %g); the optimum may lie outside — "
+            "re-run with --lambda near the winner to recenter the grid",
+            cfg["lambda"], LAMBDA_MULTIPLIERS[0], LAMBDA_MULTIPLIERS[-1],
+            base_lambda,
+        )
+
     out = dict(cfg)
     out["inner_mse"] = best
-    out["holdout_mse"] = best  # legacy name for the inner selection score
     out["split"] = split
     out["outer_frac"] = outer_frac
     out["seasons"] = seasons
@@ -263,15 +289,14 @@ def tune(
         out["outer_mse"] = _score_split(
             dev, outer_test, cfg, data_dir, seasons, season_types
         )
-        out["outer_default_mse"] = _score_split(
-            dev, outer_test, default_cfg, data_dir, seasons, season_types
+        out["outer_default_mse"] = (
+            out["outer_mse"] if cfg == default_cfg else _score_split(
+                dev, outer_test, default_cfg, data_dir, seasons, season_types
+            )
         )
-        dev_nz = dev[dev["poss"] > 0]
-        y_dev = 100.0 * dev_nz["points"].to_numpy() / dev_nz["poss"].to_numpy()
-        intercept = np.full(
-            len(outer_test), np.average(y_dev, weights=dev_nz["poss"])
+        out["outer_intercept_mse"] = _weighted_mse(
+            outer_test, intercept_baseline(dev, outer_test)
         )
-        out["outer_intercept_mse"] = _weighted_mse(outer_test, intercept)
         logger.info(
             "outer (untouched) MSE: tuned %.4f vs default %.4f vs "
             "intercept-only %.4f",
@@ -291,5 +316,9 @@ def load_tuned_config(data_dir: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"No tuned config at {path}; run `fablerapm tune` first")
     cfg = json.loads(path.read_text())
+    if cfg.get("lambda") is None:
+        raise ValueError(
+            f"Tuned config {path} has no 'lambda'; re-run `fablerapm tune`"
+        )
     # .get: configs written before a key existed fall back to its default
     return {k: cfg.get(k, default) for k, default in DEFAULT_CONFIG.items()}

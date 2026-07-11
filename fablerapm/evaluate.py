@@ -63,6 +63,38 @@ def chrono_game_order(stints: pd.DataFrame) -> list:
     return sorted(keys, key=keys.__getitem__)
 
 
+def nonzero_poss(stints: pd.DataFrame) -> pd.DataFrame:
+    """Rows that can be scored: orphaned technical FTs have poss == 0."""
+    return stints[stints["poss"] > 0].reset_index(drop=True)
+
+
+def intercept_baseline(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
+    """Intercept-only predictions for test rows: the possession-weighted
+    mean scoring rate of the train games."""
+    train_nz = nonzero_poss(train)
+    y_train = 100.0 * train_nz["points"].to_numpy() / train_nz["poss"].to_numpy()
+    return np.full(len(test), np.average(y_train, weights=train_nz["poss"]))
+
+
+def split_games(
+    stints: pd.DataFrame,
+    split: str,
+    test_frac: float,
+    seed: int = 0,
+    fold: int = 0,
+    n_folds: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """One train/test game split in the requested mode, with unscorable
+    (zero-possession) rows dropped from the test side."""
+    if split == "chrono":
+        train, test = chrono_split(stints, test_frac, fold=fold, n_folds=n_folds)
+    elif split == "random":
+        train, test = holdout_split(stints, test_frac, seed=seed)
+    else:
+        raise ValueError(f"Unknown split mode {split!r}")
+    return train, nonzero_poss(test)
+
+
 def chrono_split(
     stints: pd.DataFrame,
     test_frac: float = 0.2,
@@ -144,6 +176,7 @@ def evaluate_variants(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
     score_garbage: bool = True,
     split: str = "random",
 ) -> pd.DataFrame:
@@ -158,11 +191,7 @@ def evaluate_variants(
     ``split="chrono"`` holds out the latest ``test_frac`` games instead of a
     random sample (``seed`` is then ignored) — see ``chrono_split``.
     """
-    if split == "chrono":
-        train, test = chrono_split(stints, test_frac=test_frac)
-    else:
-        train, test = holdout_split(stints, test_frac=test_frac, seed=seed)
-    test = test[test["poss"] > 0]
+    train, test = split_games(stints, split, test_frac, seed=seed)
     if not score_garbage and "garbage" in test:
         test = test[~test["garbage"].astype(bool)]
     logger.info(
@@ -171,13 +200,10 @@ def evaluate_variants(
     )
 
     # baseline mean from TRAIN games, like every other variant
-    train_nz = train[train["poss"] > 0]
-    y_train = 100.0 * train_nz["points"].to_numpy() / train_nz["poss"].to_numpy()
-    baseline_pred = np.full(len(test), np.average(y_train, weights=train_nz["poss"]))
     rows = [{
         "variant": "intercept-only",
         "lambda": np.nan,
-        "holdout_mse": _weighted_mse(test, baseline_pred),
+        "holdout_mse": _weighted_mse(test, intercept_baseline(train, test)),
     }]
 
     for name, spec in variants.items():
@@ -189,7 +215,7 @@ def evaluate_variants(
         result = fit(
             train, lam=lam, prior=prior,
             decay=decay, playoff_weight=playoff_weight,
-            garbage_weight=garbage_weight,
+            garbage_weight=garbage_weight, garbage_rule=garbage_rule,
         )
         rows.append({
             "variant": name,

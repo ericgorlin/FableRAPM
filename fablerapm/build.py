@@ -128,7 +128,6 @@ def build_season(
 
     stints = _load_stints(spath, manifest)
     new_rows: list[dict] = []
-    started = time.monotonic()
 
     def flush():
         nonlocal stints, new_rows
@@ -159,12 +158,19 @@ def build_season(
         }
         new_rows.extend(rows)
 
-    def progress(i, total, label):
-        rate = i / (time.monotonic() - started)
-        logger.info(
-            "%s %s: %d/%d %s games (%.0f games/min)",
-            season, season_type, i, total, label, rate * 60,
-        )
+    def run_phase(results, total, label):
+        """Drain a (game_id, rows, warnings, error) iterator into the
+        manifest/parquet, flushing and logging phase-local throughput."""
+        started = time.monotonic()
+        for i, (game_id, rows, warnings, error) in enumerate(results, 1):
+            record(game_id, rows, warnings, error)
+            if i % FLUSH_EVERY == 0:
+                flush()
+                rate = i / (time.monotonic() - started)
+                logger.info(
+                    "%s %s: %d/%d %s games (%.0f games/min)",
+                    season, season_type, i, total, label, rate * 60,
+                )
 
     cached = [g for g in todo if _pbp_cached(data_dir, g)] if workers > 1 else []
     cached_set = set(cached)
@@ -177,34 +183,27 @@ def build_season(
             season, season_type, len(cached), workers, len(serial),
         )
         with multiprocessing.Pool(workers) as pool:
-            results = pool.imap_unordered(
-                _parse_game_worker, [(str(data_dir), g) for g in cached]
-            )
             try:
-                for i, (game_id, rows, warnings, error) in enumerate(results, 1):
-                    record(game_id, rows, warnings, error)
-                    if i % FLUSH_EVERY == 0:
-                        flush()
-                        progress(i, len(cached), "cached")
+                run_phase(
+                    pool.imap_unordered(
+                        _parse_game_worker, [(str(data_dir), g) for g in cached]
+                    ),
+                    len(cached), "cached",
+                )
             except KeyboardInterrupt:
                 pool.terminate()
                 flush()
                 raise
         flush()
 
-    for i, game_id in enumerate(serial, 1):
-        try:
-            rows, warnings = game_stint_rows(data_dir, game_id)
-        except KeyboardInterrupt:
-            flush()
-            raise
-        except Exception as exc:
-            record(game_id, None, [], f"{type(exc).__name__}: {exc}")
-            continue
-        record(game_id, rows, warnings, None)
-        if i % FLUSH_EVERY == 0:
-            flush()
-            progress(i, len(serial), "serial")
+    try:
+        run_phase(
+            (_parse_game_worker((str(data_dir), g)) for g in serial),
+            len(serial), "serial",
+        )
+    except KeyboardInterrupt:
+        flush()
+        raise
     flush()
 
     return {

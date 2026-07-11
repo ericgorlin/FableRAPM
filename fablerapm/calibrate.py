@@ -80,15 +80,19 @@ def _curvature_scores(result, stints: pd.DataFrame) -> dict[str, float]:
     """Per-side interaction contribution at high-concentration lineups.
 
     For each side, evaluate the fit's interaction term F @ gamma on every
-    stint row and average it (possession-weighted) over the rows in the top
-    decile of that side's standardized top2 feature — the lineups whose two
-    best talents are largest together. Units are points/100. Offense < 0
-    and defense > 0 (points-allowed terms) mean stacked talent produces
-    less than the additive model predicts.
+    stint row and average it (weighted like the fit: possessions times any
+    weight_mult column) over the rows in the top decile of that side's
+    standardized top2 feature — the lineups whose two best talents are
+    largest together. Units are points/100. Offense < 0 and defense > 0
+    (points-allowed terms) mean stacked talent produces less than the
+    additive model predicts. Pass the same weighted/filtered rows the fit
+    used, so excluded rows don't distort the decile or the average.
     """
     inter = result.meta["interaction"]
     talent = {int(k): tuple(v) for k, v in inter["talent"].items()}
     w = stints["poss"].to_numpy(dtype=float)
+    if "weight_mult" in stints:
+        w = w * stints["weight_mult"].to_numpy(dtype=float)
     scores = {}
     for side, idx, col in (("off", 0, "off_lineup"), ("def", 1, "def_lineup")):
         F, _ = _concentration_features(
@@ -107,6 +111,7 @@ def simulate_null_points(
     linear_result,
     rng: np.random.Generator,
     null: str = "poisson",
+    mu_100: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """One synthetic copy of the dataset under the fitted additive model.
 
@@ -127,9 +132,14 @@ def simulate_null_points(
     cost of assuming residuals are exchangeable after studentization.
     Simulated points are continuous (the fit never needs integers) and
     clipped at zero.
+
+    ``mu_100`` optionally supplies precomputed predicted rates (the
+    prediction is a per-row Python loop; callers drawing many sims from
+    one fit should compute it once).
     """
     poss = stints["poss"].to_numpy(dtype=float)
-    mu_100 = np.clip(predict_stints(linear_result, stints), 1e-6, None)
+    if mu_100 is None:
+        mu_100 = np.clip(predict_stints(linear_result, stints), 1e-6, None)
     sim = stints.copy()
     if null == "poisson":
         sim["points"] = rng.poisson(mu_100 * poss / 100.0)
@@ -156,6 +166,7 @@ def calibrate_curvature(
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
+    garbage_rule: tuple[float, float] | None = None,
 ) -> dict:
     """Run the null calibration on one set of stints. Returns a report dict.
 
@@ -164,8 +175,11 @@ def calibrate_curvature(
     reflects the estimator actually being calibrated (and the sims don't
     each pay for a CV sweep).
     """
+    from .evaluate import nonzero_poss
+    from .model import _apply_weight_multipliers
+
     # zero-possession rows can't be fit, predicted, or scored
-    stints = stints[stints["poss"] > 0].reset_index(drop=True)
+    stints = nonzero_poss(stints)
     # the alpha/2 and 1-alpha/2 quantiles are meaningless with fewer draws
     # than ~2/alpha; findings from a degenerate band would all be spurious
     min_sims = int(np.ceil(2.0 / alpha))
@@ -177,7 +191,8 @@ def calibrate_curvature(
             "still reported)", n_sims, min_sims, alpha,
         )
     fit_kwargs = dict(
-        decay=decay, playoff_weight=playoff_weight, garbage_weight=garbage_weight
+        decay=decay, playoff_weight=playoff_weight,
+        garbage_weight=garbage_weight, garbage_rule=garbage_rule,
     )
     if lam == "cv":
         lam, _ = cross_validate_lambda(build_design(stints))
@@ -191,22 +206,29 @@ def calibrate_curvature(
         **fit_kwargs,
     )
     real_gammas = _gammas(real)
-    real_scores = _curvature_scores(real, stints)
+    # score on the rows/weights the fit actually used (weight_mult attached,
+    # zero-weight rows dropped); the same frame serves every sim's scores,
+    # since scores depend on lineups and weights, not points
+    score_frame = _apply_weight_multipliers(stints, **fit_kwargs)
+    real_scores = _curvature_scores(real, score_frame)
 
-    # the additive generator: same linear two-phase fit the interaction
-    # model nests, so the null is "this exact model, minus the curvature"
-    phase1 = fit_rapm(stints, lam=lam, **fit_kwargs)
-    phase1_prior = {
-        int(r.player_id): (float(r.orapm), float(r.drapm))
-        for r in phase1.players.itertuples()
-    }
-    generator = fit_rapm(stints, lam=lam, prior=phase1_prior, **fit_kwargs)
+    # the additive generator: the same linear two-phase (iterated ridge)
+    # fit the interaction model nests — prior.two_phase_prior is the one
+    # implementation of that recipe — so the null is "this exact model,
+    # minus the curvature"
+    from .prior import two_phase_prior
+
+    generator = fit_rapm(
+        stints, lam=lam, prior=two_phase_prior(stints, lam=lam, **fit_kwargs),
+        **fit_kwargs,
+    )
+    mu_100 = np.clip(predict_stints(generator, stints), 1e-6, None)
 
     rng = np.random.default_rng(seed)
     null_draws: dict[str, list[float]] = {k: [] for k in real_gammas}
     null_scores: dict[str, list[float]] = {"off": [], "def": []}
     for i in range(n_sims):
-        sim = simulate_null_points(stints, generator, rng, null=null)
+        sim = simulate_null_points(stints, generator, rng, null=null, mu_100=mu_100)
         sim_fit = fit_interaction_rapm(
             sim, lam=lam,
             offense_curvature=offense_curvature,
@@ -215,14 +237,14 @@ def calibrate_curvature(
         )
         for k, g in _gammas(sim_fit).items():
             null_draws[k].append(g)
-        for side, s in _curvature_scores(sim_fit, sim).items():
+        for side, s in _curvature_scores(sim_fit, score_frame).items():
             null_scores[side].append(s)
         if (i + 1) % 10 == 0 or i + 1 == n_sims:
             logger.info("null simulation %d/%d done", i + 1, n_sims)
 
     lo_q, hi_q = 100 * alpha / 2, 100 * (1 - alpha / 2)
 
-    def summarize(real_value: float, draws: np.ndarray, name: str) -> dict:
+    def summarize(real_value: float, draws: np.ndarray) -> dict:
         lo, hi = float(np.percentile(draws, lo_q)), float(np.percentile(draws, hi_q))
         # mid-p empirical percentile of the real value within the null draws
         pct = float(
@@ -231,7 +253,7 @@ def calibrate_curvature(
             / len(draws)
         )
         return {
-            name: real_value,
+            "real": real_value,
             "null_mean": float(draws.mean()),
             "null_sd": float(draws.std()),
             "null_lo": lo,
@@ -244,11 +266,11 @@ def calibrate_curvature(
         }
 
     sides = {
-        side: summarize(real_scores[side], np.array(null_scores[side]), "score")
+        side: summarize(real_scores[side], np.array(null_scores[side]))
         for side in ("off", "def")
     }
     terms = {
-        key: summarize(g_real, np.array(null_draws[key]), "gamma")
+        key: summarize(g_real, np.array(null_draws[key]))
         for key, g_real in real_gammas.items()
     }
 
@@ -271,10 +293,10 @@ def calibrate_curvature(
 
 
 def format_report(report: dict) -> str:
-    def row(label, t, value_key):
+    def row(label, t):
         band = f"[{t['null_lo']:+.3f}, {t['null_hi']:+.3f}]"
         return (
-            f"{label:<14}{t[value_key]:>+9.3f}{t['null_mean']:>+11.3f}{band:>20}"
+            f"{label:<14}{t['real']:>+9.3f}{t['null_mean']:>+11.3f}{band:>20}"
             f"{t['percentile']:>8.1f}{t['bias_corrected']:>+11.3f}  "
             + ("OUTSIDE NULL" if t["outside_null"] else "within null")
         )
@@ -292,15 +314,15 @@ def format_report(report: dict) -> str:
         "curvature at stacked lineups (pts/100 at top-decile concentration;"
         " diminishing returns = off < 0, def > 0):",
         header,
-        row("off", report["sides"]["off"], "score"),
-        row("def", report["sides"]["def"], "score"),
+        row("off", report["sides"]["off"]),
+        row("def", report["sides"]["def"]),
         "",
         "per-term gammas (collinear basis — coordinates trade off; read the"
         " side scores above for the finding):",
         header,
     ]
     for key, t in report["terms"].items():
-        lines.append(row(key, t, "gamma"))
+        lines.append(row(key, t))
     lines.append(
         "only OUTSIDE NULL values are evidence of real curvature beyond "
         "this estimator's own bias on this dataset"

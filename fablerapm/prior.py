@@ -146,16 +146,19 @@ def two_phase_prior(
     stints: pd.DataFrame,
     lam: float | str = "cv",
     scale: float = 1.0,
+    **fit_kwargs,
 ) -> dict[int, tuple[float, float]]:
     """Phase-one RAPM estimates as the shrinkage target for phase two.
 
     With scale=1, phase two re-fits the same data while shrinking toward the
     phase-one solution instead of zero, letting large (star) coefficients
     escape the flat shrinkage that causes diminishing-returns compression.
+    Extra keyword arguments (decay, playoff_weight, garbage_weight,
+    garbage_rule) are forwarded to the phase-one fit.
     """
     from .model import fit_rapm
 
-    phase1 = fit_rapm(stints, lam=lam)
+    phase1 = fit_rapm(stints, lam=lam, **fit_kwargs)
     return {
         int(r.player_id): (scale * r.orapm, scale * r.drapm)
         for r in phase1.players.itertuples()
@@ -247,6 +250,11 @@ def spm_prior(
     model = SpmModel.from_json(path.read_text())
     if model.train_seasons:
         overlap = sorted(set(model.train_seasons) & set(seasons))
+        # same season string but disjoint season types = disjoint games
+        if overlap and model.train_season_types is not None and not (
+            set(model.train_season_types) & set(season_types)
+        ):
+            overlap = []
         if overlap:
             logger.warning(
                 "SPM prior was trained on %s, which overlaps the current "

@@ -74,58 +74,64 @@ def cmd_build(args) -> int:
     return 0
 
 
-def _parse_garbage_rule(spec: str | None) -> tuple[float, float] | None:
-    if spec is None:
-        return None
+def _garbage_rule_arg(spec: str) -> tuple[float, float]:
+    """argparse type= converter for --garbage-rule 'BASE,PER_MINUTE'."""
+    import argparse
+
     parts = [p.strip() for p in spec.split(",")]
-    if len(parts) != 2:
-        raise SystemExit(
-            f"--garbage-rule expects 'BASE,PER_MINUTE' (e.g. '12,1.5'), "
-            f"got {spec!r}"
-        )
     try:
+        if len(parts) != 2:
+            raise ValueError
         return float(parts[0]), float(parts[1])
     except ValueError:
-        raise SystemExit(
-            f"--garbage-rule expects two numbers 'BASE,PER_MINUTE', got {spec!r}"
+        raise argparse.ArgumentTypeError(
+            f"expected 'BASE,PER_MINUTE' (e.g. '12,1.5'), got {spec!r}"
         )
+
+
+def _config_to_rapm_kwargs(cfg: dict, lam) -> dict:
+    """One conversion from a tune-shaped config dict to run_rapm kwargs."""
+    rule = cfg.get("garbage_rule")
+    return dict(
+        lam=lam,
+        prior_kind=cfg["prior"],
+        prior_scale=cfg["prior_scale"],
+        decay=cfg["decay"],
+        playoff_weight=cfg["playoff_weight"],
+        garbage_weight=cfg["garbage_weight"],
+        garbage_rule=tuple(rule) if rule else None,
+        interactions=cfg["interactions"],
+        offense_curvature=cfg["offense_curvature"],
+        defense_curvature=cfg["defense_curvature"],
+    )
 
 
 def cmd_rapm(args) -> int:
     from .model import run_rapm
 
     data_dir, seasons, season_types = _resolve_common(args)
-    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
-    kwargs = dict(
-        lam=lam,
-        prior_kind=args.prior,
-        prior_scale=args.prior_scale,
-        decay=args.decay,
-        playoff_weight=args.playoff_weight,
-        garbage_weight=args.garbage_weight,
-        garbage_rule=_parse_garbage_rule(args.garbage_rule),
-        interactions=args.interactions,
-        offense_curvature=args.offense_curvature,
-        defense_curvature=args.defense_curvature,
-    )
     if args.tuned:
         from .tune import load_tuned_config
 
         cfg = load_tuned_config(data_dir)
-        rule = cfg.get("garbage_rule")
-        kwargs = dict(
-            lam=cfg["lambda"],
-            prior_kind=cfg["prior"],
-            prior_scale=cfg["prior_scale"],
-            decay=cfg["decay"],
-            playoff_weight=cfg["playoff_weight"],
-            garbage_weight=cfg["garbage_weight"],
-            garbage_rule=tuple(rule) if rule else None,
-            interactions=cfg["interactions"],
-            offense_curvature=cfg["offense_curvature"],
-            defense_curvature=cfg["defense_curvature"],
-        )
+        kwargs = _config_to_rapm_kwargs(cfg, cfg["lambda"])
         print(f"using tuned config: {kwargs}")
+    else:
+        lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+        kwargs = _config_to_rapm_kwargs(
+            {
+                "prior": args.prior,
+                "prior_scale": args.prior_scale,
+                "decay": args.decay,
+                "playoff_weight": args.playoff_weight,
+                "garbage_weight": args.garbage_weight,
+                "garbage_rule": args.garbage_rule,
+                "interactions": args.interactions,
+                "offense_curvature": args.offense_curvature,
+                "defense_curvature": args.defense_curvature,
+            },
+            lam,
+        )
     written = run_rapm(
         data_dir, seasons, season_types,
         pool_seasons=args.pool,
@@ -175,7 +181,7 @@ def cmd_calibrate_curvature(args) -> int:
         offense_curvature=args.offense_curvature,
         defense_curvature=args.defense_curvature,
         decay=args.decay, playoff_weight=args.playoff_weight,
-        garbage_weight=args.garbage_weight,
+        garbage_weight=args.garbage_weight, garbage_rule=args.garbage_rule,
     )
     print(format_report(report))
     print(f"wrote {path}")
@@ -277,6 +283,7 @@ def cmd_evaluate(args) -> int:
                     stints, variants, lam=lam,
                     test_frac=args.test_frac, seed=args.seed,
                     decay=decay, playoff_weight=pw, garbage_weight=gw,
+                    garbage_rule=args.garbage_rule,
                     score_garbage=not args.holdout_no_garbage,
                     split=args.split,
                 )
@@ -392,6 +399,7 @@ def main(argv=None) -> int:
     )
     p_rapm.add_argument(
         "--garbage-rule", default=None, metavar="BASE,PER_MINUTE",
+        type=_garbage_rule_arg,
         help="Fit-time garbage definition replacing the parse-time tiers: "
         "a Q4/OT possession is garbage when |margin| >= BASE + PER_MINUTE "
         "x minutes left in the period (e.g. '12,1.5'). Needs stints parsed "
@@ -448,7 +456,9 @@ def main(argv=None) -> int:
         "--split", choices=["chrono", "random"], default="chrono",
         help="Holdout scheme: chrono (default) trains on earlier games and "
         "tests on later ones — the honest protocol for current ratings; "
-        "random reproduces seeded game shuffles",
+        "random uses seeded game shuffles (note: with the default nested "
+        "outer split, results differ from pre-nesting tune runs even at "
+        "the same seeds; pass --outer-frac 0 to reproduce those exactly)",
     )
     p_tune.add_argument(
         "--outer-frac", type=float, default=0.2,
@@ -531,6 +541,12 @@ def main(argv=None) -> int:
         help="Playoff-stint weights to grid over (default: 1.0)",
     )
     p_eval.add_argument(
+        "--garbage-rule", default=None, metavar="BASE,PER_MINUTE",
+        type=_garbage_rule_arg,
+        help="Fit-time garbage definition applied to every variant (see "
+        "`rapm --garbage-rule`); pairs with --garbage-weights",
+    )
+    p_eval.add_argument(
         "--holdout-no-garbage", action="store_true",
         help="Exclude garbage-time rows from the holdout metric "
         "(recommended when tuning --garbage-weights)",
@@ -584,6 +600,12 @@ def main(argv=None) -> int:
     p_cal.add_argument("--decay", type=float, default=1.0)
     p_cal.add_argument("--playoff-weight", type=float, default=1.0)
     p_cal.add_argument("--garbage-weight", type=float, default=1.0)
+    p_cal.add_argument(
+        "--garbage-rule", default=None, metavar="BASE,PER_MINUTE",
+        type=_garbage_rule_arg,
+        help="Fit-time garbage definition (see `rapm --garbage-rule`) — "
+        "calibrate the same estimator configuration you fit with",
+    )
     p_cal.set_defaults(func=cmd_calibrate_curvature)
 
     p_smoke = sub.add_parser(

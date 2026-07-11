@@ -124,6 +124,25 @@ def test_garbage_rule_flags_match_threshold():
     assert not flags[~np.isfinite(margin)].any()
 
 
+def test_late_context_complete_detects_mixed_schema():
+    from fablerapm.model import late_context_complete
+
+    true_off, true_def = make_league()
+    stints = with_late_context(simulate_stints(true_off, true_def, n_games=10))
+    late = np.isfinite(stints["margin"].to_numpy())
+
+    consistent = stints.copy()
+    consistent["garbage"] = late & (np.arange(len(stints)) % 3 == 0)
+    assert late_context_complete(consistent)
+
+    # a garbage-flagged row without context = old-schema rows in the mix
+    mixed = consistent.copy()
+    mixed.loc[~late, "garbage"] = True
+    assert not late_context_complete(mixed)
+
+    assert not late_context_complete(stints.drop(columns=["margin", "secs_left"]))
+
+
 def test_garbage_rule_weight_zero_equals_filtering():
     from fablerapm.model import garbage_flags
 

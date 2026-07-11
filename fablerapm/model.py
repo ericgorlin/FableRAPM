@@ -227,8 +227,38 @@ def garbage_flags(stints: pd.DataFrame, rule: tuple[float, float] | None) -> np.
     margin = pd.to_numeric(stints["margin"], errors="coerce").to_numpy(dtype=float)
     secs = pd.to_numeric(stints["secs_left"], errors="coerce").to_numpy(dtype=float)
     late = np.isfinite(margin) & np.isfinite(secs)
+    if "garbage" in stints:
+        # rows flagged garbage at parse time but lacking late-game context
+        # were parsed before the margin/secs schema (e.g. pooling an old
+        # season's parquet with a re-parsed one): the rule can't see them
+        stale = stints["garbage"].to_numpy(dtype=bool) & ~late
+        if stale.any():
+            logger.warning(
+                "%d garbage-flagged rows lack margin/secs_left (parsed "
+                "before the late-game schema); the fit-time garbage rule "
+                "treats them as non-garbage. Re-parse those seasons "
+                "(delete their data/stints files, re-run `fablerapm "
+                "build`) for consistent treatment.",
+                int(stale.sum()),
+            )
     threshold = float(base) + float(per_minute) * secs / 60.0
     return late & (np.abs(margin) >= threshold)
+
+
+def late_context_complete(stints: pd.DataFrame) -> bool:
+    """True when every parse-time garbage row carries margin/secs_left —
+    i.e. fit-time garbage rules can see everything the stored flag sees."""
+    if "margin" not in stints or "secs_left" not in stints:
+        return False
+    late = (
+        pd.to_numeric(stints["margin"], errors="coerce").notna()
+        & pd.to_numeric(stints["secs_left"], errors="coerce").notna()
+    )
+    if not late.any():
+        return False
+    if "garbage" in stints:
+        return bool((~stints["garbage"].astype(bool) | late).all())
+    return True
 
 
 def _apply_weight_multipliers(
@@ -239,12 +269,12 @@ def _apply_weight_multipliers(
     garbage_rule: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
     """Attach a weight_mult column and drop zero-weight rows."""
+    if garbage_rule is not None and garbage_weight == 1.0:
+        logger.warning(
+            "garbage_rule has no effect at garbage_weight=1.0 (the rule "
+            "only decides which rows the weight applies to)"
+        )
     if decay == 1.0 and playoff_weight == 1.0 and garbage_weight == 1.0:
-        if garbage_rule is not None:
-            logger.warning(
-                "garbage_rule has no effect at garbage_weight=1.0 (the rule "
-                "only decides which rows the weight applies to)"
-            )
         return stints
     mult = np.ones(len(stints))
     if decay != 1.0:
@@ -572,6 +602,8 @@ def fit_interaction_rapm(
         }
     ).sort_values("rapm", ascending=False, ignore_index=True)
 
+    # phase1 was fit on already-weighted rows with default weight args, so
+    # its meta misstates the weighting config; record the real one
     meta = dict(phase1.meta)
     meta.update(
         {
@@ -579,6 +611,10 @@ def fit_interaction_rapm(
             "phase1_lambda": float(lam2),
             "intercept": float(model.intercept_),
             "prior": "custom" if prior else "phase2",
+            "decay": decay,
+            "playoff_weight": playoff_weight,
+            "garbage_weight": garbage_weight,
+            "garbage_rule": list(garbage_rule) if garbage_rule else None,
             "interaction": {
                 # per-100 effect per 1 SD of each concentration feature;
                 # negative offense values = diminishing returns

@@ -44,7 +44,7 @@ def test_tune_handles_zero_possession_rows(tmp_path):
     df.to_parquet(path, index=False)
 
     result = tune(data_dir, ["2024-25"], ["Regular Season"], n_seeds=2, lam=1000.0)
-    assert np.isfinite(result["holdout_mse"])
+    assert np.isfinite(result["inner_mse"])
     assert all(np.isfinite(h["mse"]) for h in result["history"])
 
 

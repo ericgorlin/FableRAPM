@@ -15,8 +15,9 @@ def seed_two_seasons(data_dir):
     for season, seed in [("2023-24", 31), ("2024-25", 32)]:
         df = simulate_stints(true_off, true_def, n_games=25, seed=seed)
         df["game_id"] = f"S{seed}_" + df["game_id"]
-        df["garbage"] = rng.random(len(df)) < 0.08
+        # consistent schema: garbage-flagged rows always carry late context
         late = rng.random(len(df)) < 0.25
+        df["garbage"] = late & (rng.random(len(df)) < 0.3)
         df["margin"] = np.where(
             late, rng.integers(-35, 36, len(df)).astype(float), np.nan
         )
@@ -49,7 +50,6 @@ def test_tune_writes_config_and_rapm_uses_it(tmp_path):
         h["config"].get("garbage_rule") for h in result["history"]
     )
     assert np.isfinite(result["inner_mse"])
-    assert result["holdout_mse"] == result["inner_mse"]  # legacy alias
 
     # nested evaluation: the outer block was never used for selection, and
     # its scores are reported for tuned vs default vs intercept-only

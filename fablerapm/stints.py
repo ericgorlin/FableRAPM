@@ -129,28 +129,30 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
         else:
             late = (None, None)
         for stat in possession.possession_stats:
-            key_off = None
+            # keys are (matchup, late-game context); the matchup part is
+            # the pre-margin/secs aggregation key, which the technical-FT
+            # merge below relies on
             if stat["stat_key"] == OFFENSIVE_POSSESSION_STRING:
                 # team_id is the offense
-                key_off = (
+                matchup = (
                     stat["team_id"],
                     stat["lineup_id"],
                     stat["opponent_team_id"],
                     stat["opponent_lineup_id"],
                     garbage,
-                    late,
                 )
+                key_off = (matchup, late)
                 poss_sums[key_off] = poss_sums.get(key_off, 0) + stat["stat_value"]
             elif stat["stat_key"] == OPPONENT_POINTS:
                 # team_id is the team scored against; the offense is the opponent
-                key_off = (
+                matchup = (
                     stat["opponent_team_id"],
                     stat["opponent_lineup_id"],
                     stat["team_id"],
                     stat["lineup_id"],
                     garbage,
-                    late,
                 )
+                key_off = (matchup, late)
                 point_sums[key_off] = point_sums.get(key_off, 0) + stat["stat_value"]
 
     # Technical FTs scored by the defending team are recorded against the
@@ -159,17 +161,20 @@ def possessions_to_stint_rows(possessions, game_id: str) -> list[dict]:
     # point-only keys into an existing possession key for the same lineup
     # matchup + garbage flag — the pre-margin/secs schema did this
     # implicitly by aggregating on exactly those fields — preferring the
-    # key with the most possessions. Truly unmatched points stay as
-    # poss=0 rows, dropped and counted at fit time.
+    # key with the most possessions. The merged points inherit the target
+    # row's (margin, secs_left); a rare, few-points-per-season blemish
+    # accepted to keep game score totals exact. Truly unmatched points
+    # stay as poss=0 rows, dropped and counted at fit time.
     for key in [k for k in point_sums if k not in poss_sums]:
-        matches = [k for k in poss_sums if k[:5] == key[:5]]
+        matchup = key[0]
+        matches = [k for k in poss_sums if k[0] == matchup]
         if matches:
             target = max(matches, key=poss_sums.__getitem__)
             point_sums[target] = point_sums.get(target, 0) + point_sums.pop(key)
 
     rows = []
     for key in poss_sums.keys() | point_sums.keys():
-        off_team_id, off_lineup, def_team_id, def_lineup, garbage, late = key
+        (off_team_id, off_lineup, def_team_id, def_lineup, garbage), late = key
         margin, secs_left = late
         poss_x5 = poss_sums.get(key, 0)
         points_x5 = point_sums.get(key, 0)

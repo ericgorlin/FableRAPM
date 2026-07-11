@@ -250,7 +250,7 @@ present, hours, resumable) followed by `validate` and
 ## Suggested experiments (in order)
 
 ```bash
-pip install -e ".[dev]" && pytest        # 57 offline tests, no network
+pip install -e ".[dev]" && pytest        # 58 offline tests, no network
 fablerapm smoke-test                     # ~8 live API requests, end-to-end
 ```
 
@@ -415,6 +415,18 @@ stands between here and there:
    threshold family; with margin/secs_left stored per row, a continuous
    weight surface (e.g. logistic in margin with a time-varying midpoint)
    is one function away, and tune can referee it against the thresholds.
+7. **Game dates in the stint schema**: chronological splits currently
+   order games by (season, type, game id) — schedule order — so
+   postponed/rescheduled games (COVID-era makeups) can land slightly out
+   of true date order. The cached league game log already has real dates;
+   storing a `game_date` per stint row at build time would make chrono
+   ordering exact and delete the heuristic.
+
+Note on comparing numbers across the margin/secs schema change: late-game
+rows now aggregate per possession context, so holdout/CV MSE *levels* are
+higher than pre-schema runs purely from finer row granularity (the extra
+within-stint variance is variant-independent — rankings and vs-baseline
+gaps are still comparable, absolute MSEs are not).
 
 Done and moved out of this list: null calibration for curvature signs
 (`fablerapm calibrate-curvature`, experiment 5) with Poisson or
