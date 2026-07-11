@@ -83,7 +83,7 @@ def fit_spm(
         raise ValueError(f"Only {len(merged)} matched player rows to train SPM on")
     cols = [
         c for c in features.columns
-        if c not in ("player_id", "season", "season_type", "minutes")
+        if c not in ("player_id", "season", "season_type", "minutes", "age")
         and pd.api.types.is_numeric_dtype(features[c])
     ]
     X_raw = merged[cols].to_numpy(dtype=float)
@@ -165,28 +165,228 @@ def two_phase_prior(
     }
 
 
+# Aging curve: how much of last season's RAPM persists into this season,
+# by age. Learned from consecutive-season RAPM pairs as a through-origin
+# weighted regression slope per age bucket (O and D components stacked),
+# shrunk toward the global slope by player count. The global slope is the
+# data-driven version of the single --prior-scale number; buckets let
+# young players keep more of their (improving) signal and old players less.
+AGE_BUCKETS = [(0, 23), (24, 26), (27, 29), (30, 32), (33, 200)]
+AGE_CURVE_SHRINK_N = 25  # pseudo-players pulling a bucket toward global
+AGE_CURVE_MIN_POSS = 500  # per-season possessions to enter the regression
+
+
+def age_curve_path(data_dir: Path) -> Path:
+    return data_dir / "results" / "age_curve.json"
+
+
+def _age_bucket(age: float) -> str:
+    for lo, hi in AGE_BUCKETS:
+        if lo <= age <= hi:
+            return f"{lo}-{hi}" if lo > 0 and hi < 200 else (
+                f"<={hi}" if lo == 0 else f"{lo}+"
+            )
+    raise ValueError(f"age {age} outside all buckets")
+
+
+def player_ages(
+    data_dir: Path, season: str, season_types: list[str]
+) -> dict[int, float]:
+    """Player ages in a season, from the stored feature parquets."""
+    from .features import load_features
+
+    features = load_features(data_dir, [season], season_types)
+    if "age" not in features.columns or features["age"].isna().all():
+        raise FileNotFoundError(
+            f"Features for {season} lack the age column (built before ages "
+            f"were stored); re-run `fablerapm features --seasons {season}` "
+            "— offline when the raw responses are cached"
+        )
+    ages = features.dropna(subset=["age"]).groupby("player_id")["age"].max()
+    return {int(pid): float(a) for pid, a in ages.items()}
+
+
+def _ages_for_target(
+    data_dir: Path, season: str, prev: str, season_types: list[str]
+) -> dict[int, float]:
+    """Ages in the target season, falling back to previous-season ages + 1
+    (the target season's features may not be scraped yet mid-season)."""
+    try:
+        return player_ages(data_dir, season, season_types)
+    except FileNotFoundError:
+        ages = player_ages(data_dir, prev, season_types)
+        return {pid: a + 1.0 for pid, a in ages.items()}
+
+
+def learn_age_curve(
+    data_dir: Path,
+    seasons: list[str],
+    season_types: list[str],
+    lam: float | str = "cv",
+    min_poss: float = AGE_CURVE_MIN_POSS,
+) -> dict:
+    """Learn per-age-bucket persistence of RAPM across consecutive seasons.
+
+    For every consecutive pair among ``seasons``, fit RAPM on both, join
+    players present in both (with at least ``min_poss`` average possessions
+    per season), and regress season-t values on season-(t-1) values through
+    the origin — O and D components stacked, weighted by the smaller
+    season's possessions — within age buckets (age = target-season age).
+    """
+    from .config import season_end_year
+    from .model import fit_rapm, load_stints
+
+    ordered = sorted(seasons, key=season_end_year)
+    pairs = [
+        (a, b) for a, b in zip(ordered, ordered[1:])
+        if season_end_year(b) == season_end_year(a) + 1
+    ]
+    if not pairs:
+        raise ValueError(
+            f"Need at least two consecutive seasons to learn an age curve, "
+            f"got {seasons}"
+        )
+
+    obs: list[tuple[str, float, float, float]] = []  # bucket, x, y, w
+    fits: dict[str, pd.DataFrame] = {}
+
+    def fit(season: str) -> pd.DataFrame:
+        if season not in fits:
+            logger.info("age curve: fitting %s %s", season, season_types)
+            result = fit_rapm(
+                load_stints(data_dir, [season], season_types), lam=lam
+            )
+            players = result.players.set_index("player_id")
+            players["poss"] = (players["off_poss"] + players["def_poss"]) / 2
+            fits[season] = players
+        return fits[season]
+
+    for prev, curr in pairs:
+        prev_fit, curr_fit = fit(prev), fit(curr)
+        ages = _ages_for_target(data_dir, curr, prev, season_types)
+        shared = prev_fit.index.intersection(curr_fit.index)
+        for pid in shared:
+            if pid not in ages:
+                continue
+            w = float(min(prev_fit.loc[pid, "poss"], curr_fit.loc[pid, "poss"]))
+            if w < min_poss:
+                continue
+            bucket = _age_bucket(ages[pid])
+            for comp in ("orapm", "drapm"):
+                obs.append((
+                    bucket,
+                    float(prev_fit.loc[pid, comp]),
+                    float(curr_fit.loc[pid, comp]),
+                    w,
+                ))
+
+    if not obs:
+        raise ValueError(
+            "No player-season pairs survived the possession filter; "
+            "lower --min-poss or add seasons"
+        )
+
+    df = pd.DataFrame(obs, columns=["bucket", "x", "y", "w"])
+    df["wxy"] = df["w"] * df["x"] * df["y"]
+    df["wxx"] = df["w"] * df["x"] * df["x"]
+    global_scale = float(df["wxy"].sum() / df["wxx"].sum())
+    buckets = {}
+    for (lo, hi) in AGE_BUCKETS:
+        label = _age_bucket(lo if lo > 0 else hi)
+        grp = df[df["bucket"] == label]
+        n = grp["x"].size // 2  # two components per player-season pair
+        if grp["wxx"].sum() > 0:
+            raw = float(grp["wxy"].sum() / grp["wxx"].sum())
+        else:
+            raw = global_scale
+        # shrink small buckets toward the global slope; clip to sane range
+        scale = (n * raw + AGE_CURVE_SHRINK_N * global_scale) / (
+            n + AGE_CURVE_SHRINK_N
+        )
+        buckets[label] = {
+            "scale": float(np.clip(scale, 0.0, 1.5)),
+            "raw": raw,
+            "players": int(n),
+        }
+    return {
+        "buckets": buckets,
+        "global_scale": global_scale,
+        "seasons": ordered,
+        "season_types": season_types,
+        "lambda": lam if lam == "cv" else float(lam),
+        "min_poss": float(min_poss),
+        "n_pairs": len(pairs),
+    }
+
+
+def train_age_curve(
+    data_dir: Path,
+    seasons: list[str],
+    season_types: list[str],
+    lam: float | str = "cv",
+    min_poss: float = AGE_CURVE_MIN_POSS,
+) -> Path:
+    curve = learn_age_curve(data_dir, seasons, season_types, lam, min_poss)
+    path = age_curve_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(curve, indent=1))
+    logger.info("Saved age curve to %s", path)
+    return path
+
+
+def load_age_curve(data_dir: Path) -> dict:
+    path = age_curve_path(data_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No age curve at {path}. Run `fablerapm age-curve` first."
+        )
+    return json.loads(path.read_text())
+
+
 def last_season_prior(
     data_dir: Path,
     seasons: list[str],
     season_types: list[str],
     lam: float | str = "cv",
-    scale: float = 0.7,
+    scale: float | str = 0.7,
 ) -> dict[int, tuple[float, float]]:
     """RAPM from the season before the earliest season in scope, scaled.
 
     The cheapest stabilizer for single-season RAPM: last year's estimate is
     a real prior (computed from disjoint data, so nothing leaks). ``scale``
-    < 1 reflects year-to-year regression toward the mean.
+    < 1 reflects year-to-year regression toward the mean; ``scale="age"``
+    replaces the single number with the learned aging curve (players
+    missing an age get the curve's global scale).
     """
     from .config import season_end_year, season_str
     from .model import fit_rapm, load_stints
 
-    prev = season_str(min(season_end_year(s) for s in seasons) - 1)
+    target = min(seasons, key=season_end_year)
+    prev = season_str(season_end_year(target) - 1)
     stints = load_stints(data_dir, [prev], season_types)
     logger.info("last-season prior: fitting %s %s", prev, season_types)
     result = fit_rapm(stints, lam=lam)
+
+    if scale == "age":
+        curve = load_age_curve(data_dir)
+        ages = _ages_for_target(data_dir, target, prev, season_types)
+
+        def scale_of(pid: int) -> float:
+            age = ages.get(pid)
+            if age is None:
+                return float(curve["global_scale"])
+            return float(curve["buckets"][_age_bucket(age)]["scale"])
+    else:
+        s = float(scale)
+
+        def scale_of(pid: int) -> float:
+            return s
+
     return {
-        int(r.player_id): (scale * r.orapm, scale * r.drapm)
+        int(r.player_id): (
+            scale_of(int(r.player_id)) * r.orapm,
+            scale_of(int(r.player_id)) * r.drapm,
+        )
         for r in result.players.itertuples()
     }
 

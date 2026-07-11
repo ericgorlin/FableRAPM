@@ -649,7 +649,7 @@ def run_rapm(
     fetch_names: bool = True,
     out_dir: Path | None = None,
     prior_kind: str = "none",
-    prior_scale: float = 1.0,
+    prior_scale: float | str = 1.0,
     decay: float = 1.0,
     playoff_weight: float = 1.0,
     garbage_weight: float = 1.0,
@@ -666,6 +666,11 @@ def run_rapm(
     """
     from .names import get_player_names
 
+    if prior_scale == "age" and prior_kind != "last-season":
+        raise ValueError(
+            "prior_scale='age' (the learned aging curve) only applies to "
+            "the last-season prior"
+        )
     out_dir = out_dir or results_dir(data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

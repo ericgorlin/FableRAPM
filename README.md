@@ -135,7 +135,16 @@ priors are built in:
   automatically if you apply it to a season it was trained on (its RAPM
   targets saw those games).
 - **Last-season prior** (`--prior last-season --prior-scale 0.7`): the
-  previous season's RAPM, scaled, as the shrinkage target.
+  previous season's RAPM, scaled, as the shrinkage target. The scale can
+  be a learned **aging curve** instead of one number: `fablerapm age-curve`
+  regresses season-t RAPM on season-(t-1) RAPM through the origin within
+  age buckets (O and D stacked, possession-weighted, small buckets shrunk
+  toward the global slope) across all consecutive built seasons, and
+  `--prior-scale age` applies it — young players keep more of their
+  (improving) signal, old players less. Ages come from the features
+  parquets (`fablerapm features`; re-run it if yours predate the `age`
+  column — offline when the raw responses are cached). `tune` tries the
+  age-scaled variant automatically when the curve artifact and ages exist.
 - **Nonlinear two-phase** (`--interactions`): linear two-phase plus a
   *basis* of convex talent-concentration regressors per side (top-2
   product, all-pairs sum, squared total — `model.INTERACTION_FEATURES`),
@@ -250,7 +259,7 @@ present, hours, resumable) followed by `validate` and
 ## Suggested experiments (in order)
 
 ```bash
-pip install -e ".[dev]" && pytest        # 58 offline tests, no network
+pip install -e ".[dev]" && pytest        # 62 offline tests, no network
 fablerapm smoke-test                     # ~8 live API requests, end-to-end
 ```
 
@@ -409,13 +418,11 @@ stands between here and there:
 4. **Luck adjustment** as an evaluate-able variant: replace realized 3P%
    / opponent FT% with expected values at parse time (schema addition),
    then let tune decide if it helps.
-5. **Aging curve in the last-season prior**: scale by a learned age curve
-   rather than one global `prior_scale`.
-6. **Smooth garbage downweighting**: the fit-time garbage rule is a hard
+5. **Smooth garbage downweighting**: the fit-time garbage rule is a hard
    threshold family; with margin/secs_left stored per row, a continuous
    weight surface (e.g. logistic in margin with a time-varying midpoint)
    is one function away, and tune can referee it against the thresholds.
-7. **Game dates in the stint schema**: chronological splits currently
+6. **Game dates in the stint schema**: chronological splits currently
    order games by (season, type, game id) — schedule order — so
    postponed/rescheduled games (COVID-era makeups) can land slightly out
    of true date order. The cached league game log already has real dates;

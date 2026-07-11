@@ -28,6 +28,33 @@ def seed_two_seasons(data_dir):
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=False)
 
+    # ages for 2023-24 only (2024-25 falls back to prev + 1) and a trained
+    # age curve, so tune's age-scaled last-season candidate is available
+    from fablerapm.features import features_path
+    from fablerapm.prior import age_curve_path
+    import json as _json
+    import pandas as pd
+
+    n = len(true_off)
+    feats = pd.DataFrame({
+        "player_id": np.arange(1, n + 1),
+        "minutes": 1500.0,
+        "age": rng.uniform(20, 36, n).round(),
+    })
+    fpath = features_path(data_dir, "2023-24", "Regular Season")
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    feats.to_parquet(fpath, index=False)
+    cpath = age_curve_path(data_dir)
+    cpath.parent.mkdir(parents=True, exist_ok=True)
+    cpath.write_text(_json.dumps({
+        "buckets": {
+            "<=23": {"scale": 0.9}, "24-26": {"scale": 0.8},
+            "27-29": {"scale": 0.7}, "30-32": {"scale": 0.6},
+            "33+": {"scale": 0.5},
+        },
+        "global_scale": 0.7,
+    }))
+
 
 def test_tune_writes_config_and_rapm_uses_it(tmp_path):
     data_dir = tmp_path / "data"
@@ -48,6 +75,10 @@ def test_tune_writes_config_and_rapm_uses_it(tmp_path):
     # fit-time garbage rules were searched (schema carries margin/secs_left)
     assert any(
         h["config"].get("garbage_rule") for h in result["history"]
+    )
+    # the age-scaled last-season prior was a candidate (curve + ages seeded)
+    assert any(
+        h["config"]["prior_scale"] == "age" for h in result["history"]
     )
     assert np.isfinite(result["inner_mse"])
 

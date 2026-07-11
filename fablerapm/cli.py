@@ -223,6 +223,41 @@ def cmd_features(args) -> int:
     return 0
 
 
+def _prior_scale_arg(v: str):
+    """argparse type= for --prior-scale: a float, or 'age' (learned curve)."""
+    import argparse
+
+    if v == "age":
+        return v
+    try:
+        return float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number or 'age', got {v!r}")
+
+
+def cmd_age_curve(args) -> int:
+    from .prior import learn_age_curve, age_curve_path
+    import json as _json
+
+    data_dir, seasons, season_types = _resolve_common(args)
+    lam = "cv" if args.ridge_lambda == "cv" else float(args.ridge_lambda)
+    curve = learn_age_curve(
+        data_dir, seasons, season_types, lam=lam, min_poss=args.min_poss
+    )
+    path = age_curve_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(curve, indent=1))
+    print(f"{'age':<8}{'scale':>8}{'raw':>8}{'players':>9}")
+    for label, b in curve["buckets"].items():
+        print(f"{label:<8}{b['scale']:>8.3f}{b['raw']:>8.3f}{b['players']:>9d}")
+    print(
+        f"global {curve['global_scale']:.3f} over {curve['n_pairs']} season "
+        f"pair(s); wrote {path}"
+    )
+    print("use it with: fablerapm rapm --prior last-season --prior-scale age")
+    return 0
+
+
 def cmd_spm_train(args) -> int:
     from .prior import train_spm
 
@@ -377,9 +412,11 @@ def main(argv=None) -> int:
         "'last-season' uses the previous season's RAPM",
     )
     p_rapm.add_argument(
-        "--prior-scale", type=float, default=1.0,
+        "--prior-scale", type=_prior_scale_arg, default=1.0,
         help="Scale applied to two-phase/last-season priors (default 1.0; "
-        "~0.5-0.8 is sensible for last-season)",
+        "~0.5-0.8 is sensible for last-season), or 'age' to use the learned "
+        "aging curve with --prior last-season (run `fablerapm age-curve` "
+        "first)",
     )
     p_rapm.add_argument(
         "--decay", type=float, default=1.0,
@@ -488,6 +525,21 @@ def main(argv=None) -> int:
         help="Skip player-tracking endpoints (tracking exists 2013-14+)",
     )
     p_feat.set_defaults(func=cmd_features)
+
+    p_age = sub.add_parser(
+        "age-curve",
+        help="Learn per-age persistence of RAPM from consecutive built "
+        "seasons (needs features for ages); saves data/results/age_curve.json "
+        "for `rapm --prior last-season --prior-scale age`",
+    )
+    _add_common(p_age)
+    p_age.add_argument("--lambda", dest="ridge_lambda", default="cv")
+    p_age.add_argument(
+        "--min-poss", type=float, default=500,
+        help="Minimum average possessions in BOTH seasons of a pair for a "
+        "player to enter the regression (default 500)",
+    )
+    p_age.set_defaults(func=cmd_age_curve)
 
     p_spm = sub.add_parser(
         "spm-train",

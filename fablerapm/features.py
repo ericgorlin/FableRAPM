@@ -123,6 +123,9 @@ def build_season_features(
         keep = _prefixed(df, prefix)
         if measure == "Base":
             keep.insert(1, "minutes", df["MIN"].astype(float) * df["GP"].astype(float))
+            # metadata, not an SPM feature (fit_spm excludes it): feeds the
+            # aging curve for the last-season prior
+            keep.insert(2, "age", df["AGE"].astype(float))
         frames.append(keep)
 
     if tracking and season_end_year(season) >= FIRST_TRACKING_SEASON_END_YEAR:

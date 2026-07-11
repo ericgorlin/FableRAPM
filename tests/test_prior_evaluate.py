@@ -18,6 +18,7 @@ def make_features(true_off, true_def, noise=0.3):
     return pd.DataFrame({
         "player_id": np.arange(1, n + 1),
         "minutes": rng.uniform(500, 2500, n),
+        "age": rng.uniform(19, 40, n).round(),
         "box_PTS": 100 * true_off + rng.normal(0, noise, n) + 20,
         "box_AST": 50 * true_off + rng.normal(0, noise, n) + 5,
         "box_STL": -60 * true_def + rng.normal(0, noise, n) + 2,
@@ -35,6 +36,10 @@ def test_spm_fit_predict_roundtrip():
         "drapm": -100 * true_def + rng.normal(0, 0.5, N_PLAYERS),
     })
     model = fit_spm(features, targets)
+    # metadata columns feed other machinery (minutes-weighting, age curve),
+    # never the SPM regression itself
+    assert "age" not in model.feature_cols
+    assert "minutes" not in model.feature_cols
     prior = predict_spm(model, features)
     assert set(prior) == set(range(1, N_PLAYERS + 1))
     o_pred = np.array([prior[i + 1][0] for i in range(N_PLAYERS)])

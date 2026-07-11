@@ -167,6 +167,25 @@ def _candidate_grids(stints, data_dir, seasons, season_types, base_lambda) -> li
             {"prior": "last-season", "prior_scale": 0.5},
             {"prior": "last-season", "prior_scale": 0.7},
         ]
+        # the age variant additionally needs age_curve.json + player ages
+        from .config import season_end_year, season_str
+        from .prior import _ages_for_target, age_curve_path
+
+        if age_curve_path(data_dir).exists():
+            target = min(seasons, key=season_end_year)
+            prev = season_str(season_end_year(target) - 1)
+            try:
+                _ages_for_target(data_dir, target, prev, season_types)
+                prior_options.append(
+                    {"prior": "last-season", "prior_scale": "age"}
+                )
+            except FileNotFoundError as exc:
+                logger.info("age-scaled last-season prior needs ages: %s", exc)
+        else:
+            logger.info(
+                "no age curve trained (`fablerapm age-curve`); skipping "
+                "age-scaled last-season prior"
+            )
     except FileNotFoundError:
         logger.info("previous season not built; skipping last-season prior")
     grids.append(("prior", prior_options))
