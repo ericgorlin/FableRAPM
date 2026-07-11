@@ -48,6 +48,31 @@ Staying up to date during a season is just re-running the same two commands
 (cron-friendly): `build` refetches the current season's schedule, scrapes
 only new final games, and appends; `rapm` refits from the stored stints.
 
+## Command reference
+
+Every command takes `--data-dir`, `--seasons` (`all`, `recent-3`,
+`2019-20`, `2005-06:2010-11`, comma-separated mixes), and
+`--season-types` (`regular,playoffs,playin`). `--help` on any subcommand
+lists its full flags.
+
+| command | what it does | needs | writes |
+|---|---|---|---|
+| `smoke-test` | tiny live end-to-end check (~8 API requests) | network | `data/smoke/` |
+| `build` | scrape + parse games into stint rows; incremental & resumable; `--workers N` parallelizes re-parses of already-cached games | network (first time) | `data/stints/*.parquet` + manifests |
+| `validate` | cross-check stint totals vs official game-log scores, coverage, pts/100 | built stints | report to stdout |
+| `features` | per-player box/tracking features + ages (8 requests/season; offline re-run once raw responses are cached) | network (first time) | `data/features/*.parquet` |
+| `spm-train` | train the SPM prior from features + per-season RAPM; **train on seasons disjoint from the ones you'll evaluate** | stints + features | `data/results/spm_model.json` |
+| `age-curve` | learn per-age persistence of RAPM from consecutive built seasons | 2+ consecutive built seasons + features (ages) | `data/results/age_curve.json` |
+| `tune` | nested, chronological search over every tunable parameter; reports unbiased `outer_mse` | built stints (priors/curve optional — candidates auto-skip) | `data/results/tuned_config.json` |
+| `rapm` | fit and write ratings; `--tuned` uses the tune winner | built stints | `data/results/rapm_*.csv` + `.meta.json` |
+| `evaluate` | compare specific variants/weights on held-out games (`--split chrono` for forward-chaining) | built stints | table to stdout |
+| `calibrate-curvature` | null calibration: is fitted lineup curvature real or estimator bias? | built stints | `data/results/curvature_calibration_*.json` |
+
+Dependency order: `build` → `validate` → `features` → (`spm-train`,
+`age-curve`) → `tune` → `rapm --tuned`, with `evaluate` and
+`calibrate-curvature` as the referees whenever you want to test a specific
+claim. Only `build`, `features`, and `smoke-test` ever touch the network.
+
 ## Outputs
 
 `data/results/rapm_<seasons>_<types>.csv`:
@@ -238,23 +263,40 @@ referee for all of them.
 
 ## Zero-decisions quickstart
 
-If you don't want to choose anything yourself, run exactly this (each step
-is resumable; interrupt freely):
+If you don't want to choose anything yourself, run exactly this, in this
+order (every step is resumable; interrupt freely):
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # offline checks
-fablerapm smoke-test                     # ~8 live API requests
-fablerapm build --seasons recent-3       # scrape 3 most recent seasons
-fablerapm validate --seasons recent-3    # verify vs official scores
-fablerapm tune                           # learn all tunable params (defaults to recent-3)
+pytest                                   # 62 offline tests, no network
+fablerapm smoke-test                     # ~8 live API requests, end-to-end
+
+# data (network; ~25 min/season, resumable)
+fablerapm build --seasons recent-4       # recent-4 so age-curve gets 3 pairs
+fablerapm validate --seasons recent-4    # verify vs official scores
+
+# artifacts that upgrade tune's candidate pool (each optional — tune
+# auto-skips candidates whose artifact is missing)
+fablerapm features --seasons recent-4    # ages + SPM inputs, 8 req/season
+fablerapm age-curve                      # learns from all built pairs
+
+# learn every free parameter, then fit with the winner
+fablerapm tune                           # defaults to recent-3, chrono, nested
 fablerapm rapm --seasons recent-3 --tuned
 ```
+
+When `tune` finishes, read its last lines: `outer_mse` vs
+`outer_default_mse` vs `outer_intercept_mse` on the untouched outer games
+is the honest report of what tuning bought — the inner MSE only ranked the
+candidates. The winning config is in `data/results/tuned_config.json`
+(with the full search history), and `rapm --tuned` uses it.
 
 Then extend backwards at your leisure: `fablerapm build` (full 1996-97 ->
 present, hours, resumable) followed by `validate` and
 `fablerapm rapm --tuned` for per-season history. `--seasons recent-N` and
-`all` work everywhere.
+`all` work everywhere. If you ever need to re-parse stored seasons (e.g.
+after deleting `data/stints/` to pick up a schema change), the raw cache
+makes it offline — add `--workers 8` to parallelize it.
 
 ## Suggested experiments (in order)
 
@@ -290,11 +332,20 @@ fablerapm evaluate --seasons 2021-22:2023-24 \
 ```bash
 fablerapm evaluate --seasons 2023-24 --two-phase-scales 0.5 1.0 \
     --last-season-scales 0.5 0.7          # needs 2022-23 built
-fablerapm features --seasons 2015-16:2023-24     # box + tracking, 8 req/season
+fablerapm features --seasons 2015-16:2023-24     # box + tracking + ages
 fablerapm spm-train --seasons 2015-16:2022-23 --season-types regular
 fablerapm evaluate --seasons 2023-24 --spm
 fablerapm rapm --seasons 2023-24 --prior spm     # writes *_spm.csv
+
+# the aging curve: a learned replacement for the last-season scale number
+fablerapm age-curve --seasons 2015-16:2023-24    # prints per-bucket table
+fablerapm rapm --seasons 2023-24 --prior last-season --prior-scale age
 ```
+
+The `age-curve` table is worth reading even if you never use the prior:
+its `global` slope is the data's answer to "what should the last-season
+scale have been", and the bucket spread shows how differently young and
+old players' impact persists year to year.
 
 **4. The LeBron/KG experiment** (diminishing returns on stacked stars).
 Build 2003-04 through 2013-14, then compare pooled fits:
